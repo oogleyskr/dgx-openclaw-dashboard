@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DGX OpenClaw Dashboard</title>
+<style>
+  /* ------------------------------------------------------------------ */
+  /* Base / Reset                                                        */
+  /* ------------------------------------------------------------------ */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0d1117;
+    --surface:   #161b22;
+    --border:    #30363d;
+    --text:      #e6edf3;
+    --text-dim:  #8b949e;
+    --green:     #3fb950;
+    --red:       #f85149;
+    --yellow:    #d29922;
+    --blue:      #58a6ff;
+    --cyan:      #39d353;
+    --radius:    8px;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Layout                                                              */
+  /* ------------------------------------------------------------------ */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .header .meta { font-size: 13px; color: var(--text-dim); }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 16px;
+    padding: 24px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Cards                                                               */
+  /* ------------------------------------------------------------------ */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: var(--border);
+    transition: background 0.3s;
+  }
+  .card.ok::before    { background: var(--green); }
+  .card.error::before { background: var(--red); }
+  .card.degraded::before { background: var(--yellow); }
+  .card.loading::before {
+    background: linear-gradient(90deg, var(--border) 25%, var(--blue) 50%, var(--border) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+  @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+  .card-title {
+    font-size: 14px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .badge.ok      { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge.error   { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge.degraded{ background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge.loading { background: rgba(88,166,255,0.15); color: var(--blue); }
+
+  /* ------------------------------------------------------------------ */
+  /* Metric rows                                                         */
+  /* ------------------------------------------------------------------ */
+  .metric {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+    font-size: 14px;
+  }
+  .metric:last-child { border-bottom: none; }
+  .metric .label { color: var(--text-dim); }
+  .metric .value { font-weight: 500; font-variant-numeric: tabular-nums; }
+
+  /* ------------------------------------------------------------------ */
+  /* Progress bar (for GPU / memory)                                     */
+  /* ------------------------------------------------------------------ */
+  .bar-wrap {
+    width: 100%;
+    height: 8px;
+    background: var(--border);
+    border-radius: 4px;
+    margin-top: 6px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.5s ease;
+  }
+  .bar-fill.green  { background: var(--green); }
+  .bar-fill.yellow { background: var(--yellow); }
+  .bar-fill.red    { background: var(--red); }
+
+  /* ------------------------------------------------------------------ */
+  /* Logs                                                                */
+  /* ------------------------------------------------------------------ */
+  .log-list {
+    list-style: none;
+    font-size: 12px;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    color: var(--text-dim);
+    max-height: 160px;
+    overflow-y: auto;
+  }
+  .log-list li {
+    padding: 3px 0;
+    border-bottom: 1px solid rgba(48,54,61,0.3);
+    word-break: break-all;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Error message                                                       */
+  /* ------------------------------------------------------------------ */
+  .error-msg {
+    color: var(--red);
+    font-size: 13px;
+    padding: 8px 0;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Footer                                                              */
+  /* ------------------------------------------------------------------ */
+  .footer {
+    text-align: center;
+    padding: 16px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Responsive                                                          */
+  /* ------------------------------------------------------------------ */
+  @media (max-width: 600px) {
+    .grid { padding: 12px; gap: 12px; grid-template-columns: 1fr; }
+    .header { flex-direction: column; gap: 4px; text-align: center; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ================================================================== -->
+<!-- Header                                                              -->
+<!-- ================================================================== -->
+<header class="header">
+  <h1>DGX OpenClaw Dashboard</h1>
+  <div class="meta">
+    <span id="overall-badge" class="badge loading">connecting</span>
+    &nbsp; Last updated: <span id="last-update">--</span>
+    &nbsp; Refresh: <span id="collect-time">--</span>
+  </div>
+</header>
+
+<!-- ================================================================== -->
+<!-- Cards grid                                                          -->
+<!-- ================================================================== -->
+<main class="grid">
+
+  <!-- GPU Stats -->
+  <section class="card loading" id="card-gpu">
+    <div class="card-title">
+      GPU Stats
+      <span class="badge loading" id="gpu-badge">--</span>
+    </div>
+    <div id="gpu-body">
+      <div class="metric"><span class="label">Loading...</span></div>
+    </div>
+  </section>
+
+  <!-- vLLM Status -->
+  <section class="card loading" id="card-vllm">
+    <div class="card-title">
+      vLLM Inference
+      <span class="badge loading" id="vllm-badge">--</span>
+    </div>
+    <div id="vllm-body">
+      <div class="metric"><span class="label">Loading...</span></div>
+    </div>
+  </section>
+
+  <!-- OpenClaw Gateway -->
+  <section class="card loading" id="card-openclaw">
+    <div class="card-title">
+      OpenClaw Gateway
+      <span class="badge loading" id="openclaw-badge">--</span>
+    </div>
+    <div id="openclaw-body">
+      <div class="metric"><span class="label">Loading...</span></div>
+    </div>
+  </section>
+
+  <!-- SSH Tunnel -->
+  <section class="card loading" id="card-tunnel">
+    <div class="card-title">
+      SSH Tunnel
+      <span class="badge loading" id="tunnel-badge">--</span>
+    </div>
+    <div id="tunnel-body">
+      <div class="metric"><span class="label">Loading...</span></div>
+    </div>
+  </section>
+
+  <!-- Recent Activity / Logs -->
+  <section class="card" id="card-activity" style="grid-column: 1 / -1;">
+    <div class="card-title">Recent Activity</div>
+    <ul class="log-list" id="activity-log">
+      <li>Waiting for first poll...</li>
+    </ul>
+  </section>
+
+</main>
+
+<footer class="footer">
+  DGX Spark (NVIDIA GB10) &middot; 128 GB unified LPDDR5x &middot; ARM64 &middot; Ubuntu 24.04
+</footer>
+
+<!-- ================================================================== -->
+<!-- Dashboard logic                                                     -->
+<!-- ================================================================== -->
+<script>
+(function() {
+  'use strict';
+
+  const POLL_INTERVAL = 10000; // 10 seconds
+  const MAX_LOG_ENTRIES = 50;
+
+  // -- DOM refs --
+  const $overall   = document.getElementById('overall-badge');
+  const $lastUpdate = document.getElementById('last-update');
+  const $collectTime = document.getElementById('collect-time');
+
+  const cards = {
+    gpu:      { card: 'card-gpu',      badge: 'gpu-badge',      body: 'gpu-body' },
+    vllm:     { card: 'card-vllm',     badge: 'vllm-badge',     body: 'vllm-body' },
+    openclaw: { card: 'card-openclaw', badge: 'openclaw-badge', body: 'openclaw-body' },
+    tunnel:   { card: 'card-tunnel',   badge: 'tunnel-badge',   body: 'tunnel-body' },
+  };
+
+  const activityLog = document.getElementById('activity-log');
+  let logEntries = [];
+
+  // ----------------------------------------------------------------
+  // Helpers
+  // ----------------------------------------------------------------
+
+  function setStatus(cardKey, status) {
+    const c = cards[cardKey];
+    const el = document.getElementById(c.card);
+    const badge = document.getElementById(c.badge);
+    el.className = 'card ' + status;
+    badge.className = 'badge ' + status;
+    badge.textContent = status.toUpperCase();
+  }
+
+  function metric(label, value) {
+    return '<div class="metric"><span class="label">' + label + '</span><span class="value">' + value + '</span></div>';
+  }
+
+  function progressBar(pct) {
+    var cls = pct < 70 ? 'green' : pct < 90 ? 'yellow' : 'red';
+    return '<div class="bar-wrap"><div class="bar-fill ' + cls + '" style="width:' + pct + '%"></div></div>';
+  }
+
+  function addLog(msg) {
+    var ts = new Date().toLocaleTimeString();
+    logEntries.unshift('[' + ts + '] ' + msg);
+    if (logEntries.length > MAX_LOG_ENTRIES) logEntries.pop();
+    activityLog.innerHTML = logEntries.map(function(e){ return '<li>' + e + '</li>'; }).join('');
+  }
+
+  // ----------------------------------------------------------------
+  // Renderers
+  // ----------------------------------------------------------------
+
+  function renderGpu(data) {
+    var body = document.getElementById(cards.gpu.body);
+    setStatus('gpu', data.status);
+
+    if (data.status === 'error') {
+      body.innerHTML = '<div class="error-msg">' + (data.error || 'Unknown error') + '</div>';
+      addLog('GPU: error - ' + (data.error || ''));
+      return;
+    }
+
+    body.innerHTML =
+      metric('GPU', data.gpu_name || '--') +
+      metric('Driver', data.driver_version || '--') +
+      metric('Utilization', data.utilization_pct + '%') +
+      progressBar(data.utilization_pct) +
+      metric('Memory', data.memory_used_mb + ' / ' + data.memory_total_mb + ' MB (' + data.memory_pct + '%)') +
+      progressBar(data.memory_pct) +
+      metric('Temperature', data.temperature_c + ' C') +
+      metric('Power', data.power_w + ' W');
+
+    addLog('GPU: ' + data.utilization_pct + '% util, ' + data.temperature_c + 'C, ' + data.memory_pct + '% mem');
+  }
+
+  function renderVllm(data) {
+    var body = document.getElementById(cards.vllm.body);
+    setStatus('vllm', data.status);
+
+    if (data.status === 'error') {
+      body.innerHTML = '<div class="error-msg">' + (data.error || 'Unreachable') + '</div>';
+      addLog('vLLM: DOWN - ' + (data.error || ''));
+      return;
+    }
+
+    body.innerHTML =
+      metric('Health', data.health || '--') +
+      metric('Model', data.model || '--') +
+      metric('Endpoint', 'localhost:8001');
+
+    addLog('vLLM: healthy, model=' + (data.model || 'unknown'));
+  }
+
+  function renderOpenclaw(data) {
+    var body = document.getElementById(cards.openclaw.body);
+    setStatus('openclaw', data.status);
+
+    var html = metric('Service', data.service || '--') +
+               metric('State', data.state || '--');
+
+    if (data.recent_logs && data.recent_logs.length) {
+      html += '<div style="margin-top:8px"><ul class="log-list">';
+      data.recent_logs.forEach(function(l) {
+        html += '<li>' + l.replace(/</g, '&lt;') + '</li>';
+      });
+      html += '</ul></div>';
+    }
+
+    if (data.status === 'error') {
+      html += '<div class="error-msg">Service inactive</div>';
+      addLog('OpenClaw: INACTIVE');
+    } else {
+      addLog('OpenClaw: active');
+    }
+
+    body.innerHTML = html;
+  }
+
+  function renderTunnel(data) {
+    var body = document.getElementById(cards.tunnel.body);
+    setStatus('tunnel', data.status);
+
+    var html = metric('Service', data.service || '--') +
+               metric('State', data.state || '--');
+
+    if (data.port_8001) {
+      html += metric('Port 8001', data.port_8001);
+    }
+
+    if (data.status === 'error') {
+      html += '<div class="error-msg">Tunnel down</div>';
+      addLog('Tunnel: DOWN');
+    } else if (data.status === 'degraded') {
+      html += '<div class="error-msg">Service active but port not listening</div>';
+      addLog('Tunnel: degraded (port not listening)');
+    } else {
+      addLog('Tunnel: active, port 8001 listening');
+    }
+
+    body.innerHTML = html;
+  }
+
+  // ----------------------------------------------------------------
+  // Polling
+  // ----------------------------------------------------------------
+
+  function poll() {
+    fetch('/api/overview')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        // Overall badge
+        $overall.className = 'badge ' + data.overall;
+        $overall.textContent = data.overall.toUpperCase();
+        $lastUpdate.textContent = data.timestamp || new Date().toISOString();
+        $collectTime.textContent = (data.collect_time_ms || '--') + ' ms';
+
+        // Render each card
+        if (data.gpu)      renderGpu(data.gpu);
+        if (data.vllm)     renderVllm(data.vllm);
+        if (data.openclaw) renderOpenclaw(data.openclaw);
+        if (data.tunnel)   renderTunnel(data.tunnel);
+      })
+      .catch(function(err) {
+        $overall.className = 'badge error';
+        $overall.textContent = 'OFFLINE';
+        addLog('Fetch error: ' + err);
+      });
+  }
+
+  // Initial poll + interval
+  poll();
+  setInterval(poll, POLL_INTERVAL);
+
+})();
+</script>
+
+</body>
+</html>
