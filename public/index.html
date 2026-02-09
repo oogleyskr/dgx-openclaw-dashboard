@@ -145,6 +145,22 @@
   .bar-fill.red    { background: var(--red); }
 
   /* ------------------------------------------------------------------ */
+  /* Session list                                                        */
+  /* ------------------------------------------------------------------ */
+  .session-list {
+    list-style: none;
+    font-size: 12px;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    color: var(--text-dim);
+    margin-top: 8px;
+  }
+  .session-list li {
+    padding: 2px 0;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Logs                                                                */
   /* ------------------------------------------------------------------ */
   .log-list {
@@ -219,24 +235,24 @@
     </div>
   </section>
 
-  <!-- vLLM Status -->
-  <section class="card loading" id="card-vllm">
+  <!-- Model Provider -->
+  <section class="card loading" id="card-provider">
     <div class="card-title">
-      vLLM Inference
-      <span class="badge loading" id="vllm-badge">--</span>
+      Model Server (llama.cpp)
+      <span class="badge loading" id="provider-badge">--</span>
     </div>
-    <div id="vllm-body">
+    <div id="provider-body">
       <div class="metric"><span class="label">Loading...</span></div>
     </div>
   </section>
 
   <!-- OpenClaw Gateway -->
-  <section class="card loading" id="card-openclaw">
+  <section class="card loading" id="card-gateway">
     <div class="card-title">
       OpenClaw Gateway
-      <span class="badge loading" id="openclaw-badge">--</span>
+      <span class="badge loading" id="gateway-badge">--</span>
     </div>
-    <div id="openclaw-body">
+    <div id="gateway-body">
       <div class="metric"><span class="label">Loading...</span></div>
     </div>
   </section>
@@ -264,6 +280,7 @@
 
 <footer class="footer">
   DGX Spark (NVIDIA GB10) &middot; 128 GB unified LPDDR5x &middot; ARM64 &middot; Ubuntu 24.04
+  &middot; Data via OpenClaw Gateway RPC
 </footer>
 
 <!-- ================================================================== -->
@@ -273,51 +290,63 @@
 (function() {
   'use strict';
 
-  const POLL_INTERVAL = 10000; // 10 seconds
-  const MAX_LOG_ENTRIES = 50;
+  var POLL_INTERVAL = 10000;
+  var MAX_LOG_ENTRIES = 50;
 
-  // -- DOM refs --
-  const $overall   = document.getElementById('overall-badge');
-  const $lastUpdate = document.getElementById('last-update');
-  const $collectTime = document.getElementById('collect-time');
+  var $overall    = document.getElementById('overall-badge');
+  var $lastUpdate = document.getElementById('last-update');
+  var $collectTime = document.getElementById('collect-time');
 
-  const cards = {
+  var cards = {
     gpu:      { card: 'card-gpu',      badge: 'gpu-badge',      body: 'gpu-body' },
-    vllm:     { card: 'card-vllm',     badge: 'vllm-badge',     body: 'vllm-body' },
-    openclaw: { card: 'card-openclaw', badge: 'openclaw-badge', body: 'openclaw-body' },
+    provider: { card: 'card-provider', badge: 'provider-badge', body: 'provider-body' },
+    gateway:  { card: 'card-gateway',  badge: 'gateway-badge',  body: 'gateway-body' },
     tunnel:   { card: 'card-tunnel',   badge: 'tunnel-badge',   body: 'tunnel-body' },
   };
 
-  const activityLog = document.getElementById('activity-log');
-  let logEntries = [];
+  var activityLog = document.getElementById('activity-log');
+  var logEntries = [];
 
   // ----------------------------------------------------------------
   // Helpers
   // ----------------------------------------------------------------
 
   function setStatus(cardKey, status) {
-    const c = cards[cardKey];
-    const el = document.getElementById(c.card);
-    const badge = document.getElementById(c.badge);
+    var c = cards[cardKey];
+    var el = document.getElementById(c.card);
+    var badge = document.getElementById(c.badge);
     el.className = 'card ' + status;
     badge.className = 'badge ' + status;
     badge.textContent = status.toUpperCase();
   }
 
   function metric(label, value) {
-    return '<div class="metric"><span class="label">' + label + '</span><span class="value">' + value + '</span></div>';
+    return '<div class="metric"><span class="label">' + esc(label) + '</span><span class="value">' + esc(String(value)) + '</span></div>';
   }
 
   function progressBar(pct) {
     var cls = pct < 70 ? 'green' : pct < 90 ? 'yellow' : 'red';
-    return '<div class="bar-wrap"><div class="bar-fill ' + cls + '" style="width:' + pct + '%"></div></div>';
+    return '<div class="bar-wrap"><div class="bar-fill ' + cls + '" style="width:' + Math.min(pct, 100) + '%"></div></div>';
+  }
+
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
   }
 
   function addLog(msg) {
     var ts = new Date().toLocaleTimeString();
     logEntries.unshift('[' + ts + '] ' + msg);
     if (logEntries.length > MAX_LOG_ENTRIES) logEntries.pop();
-    activityLog.innerHTML = logEntries.map(function(e){ return '<li>' + e + '</li>'; }).join('');
+    activityLog.innerHTML = logEntries.map(function(e){ return '<li>' + esc(e) + '</li>'; }).join('');
+  }
+
+  function formatAge(seconds) {
+    if (seconds < 60) return seconds + 's ago';
+    if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+    if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
+    return Math.floor(seconds / 86400) + 'd ago';
   }
 
   // ----------------------------------------------------------------
@@ -329,86 +358,135 @@
     setStatus('gpu', data.status);
 
     if (data.status === 'error') {
-      body.innerHTML = '<div class="error-msg">' + (data.error || 'Unknown error') + '</div>';
+      body.innerHTML = '<div class="error-msg">' + esc(data.error || 'Unknown error') + '</div>';
       addLog('GPU: error - ' + (data.error || ''));
       return;
     }
 
-    body.innerHTML =
+    var html =
       metric('GPU', data.gpu_name || '--') +
-      metric('Driver', data.driver_version || '--') +
-      metric('Utilization', data.utilization_pct + '%') +
-      progressBar(data.utilization_pct) +
-      metric('Memory', data.memory_used_mb + ' / ' + data.memory_total_mb + ' MB (' + data.memory_pct + '%)') +
-      progressBar(data.memory_pct) +
-      metric('Temperature', data.temperature_c + ' C') +
-      metric('Power', data.power_w + ' W');
+      metric('Host', data.host || '--') +
+      metric('Utilization', (data.utilization_pct || 0) + '%') +
+      progressBar(data.utilization_pct || 0);
 
-    addLog('GPU: ' + data.utilization_pct + '% util, ' + data.temperature_c + 'C, ' + data.memory_pct + '% mem');
-  }
-
-  function renderVllm(data) {
-    var body = document.getElementById(cards.vllm.body);
-    setStatus('vllm', data.status);
-
-    if (data.status === 'error') {
-      body.innerHTML = '<div class="error-msg">' + (data.error || 'Unreachable') + '</div>';
-      addLog('vLLM: DOWN - ' + (data.error || ''));
-      return;
+    if (data.memory_used_mb != null) {
+      html +=
+        metric('Memory', data.memory_used_mb + ' / ' + data.memory_total_mb + ' MB (' + data.memory_pct + '%)') +
+        progressBar(data.memory_pct);
+    } else if (data.memory_note) {
+      html += metric('Memory', data.memory_note);
     }
 
-    body.innerHTML =
-      metric('Health', data.health || '--') +
-      metric('Model', data.model || '--') +
-      metric('Endpoint', 'localhost:8001');
+    html += metric('Temperature', (data.temperature_c || '--') + ' C');
 
-    addLog('vLLM: healthy, model=' + (data.model || 'unknown'));
-  }
-
-  function renderOpenclaw(data) {
-    var body = document.getElementById(cards.openclaw.body);
-    setStatus('openclaw', data.status);
-
-    var html = metric('Service', data.service || '--') +
-               metric('State', data.state || '--');
-
-    if (data.recent_logs && data.recent_logs.length) {
-      html += '<div style="margin-top:8px"><ul class="log-list">';
-      data.recent_logs.forEach(function(l) {
-        html += '<li>' + l.replace(/</g, '&lt;') + '</li>';
-      });
-      html += '</ul></div>';
-    }
-
-    if (data.status === 'error') {
-      html += '<div class="error-msg">Service inactive</div>';
-      addLog('OpenClaw: INACTIVE');
-    } else {
-      addLog('OpenClaw: active');
+    if (data.power_w != null) {
+      var powerStr = data.power_w + ' W';
+      if (data.power_limit_w) powerStr += ' / ' + data.power_limit_w + ' W';
+      html += metric('Power', powerStr);
     }
 
     body.innerHTML = html;
+    addLog('GPU: ' + (data.utilization_pct || 0) + '% util, ' + (data.temperature_c || '--') + 'C');
+  }
+
+  function renderProvider(data) {
+    var body = document.getElementById(cards.provider.body);
+    setStatus('provider', data.status);
+
+    if (data.status === 'error') {
+      body.innerHTML = '<div class="error-msg">' + esc(data.error || 'Unreachable') + '</div>';
+      if (data.consecutive_failures) {
+        body.innerHTML += metric('Consecutive Failures', data.consecutive_failures);
+      }
+      addLog('Provider: DOWN - ' + (data.error || ''));
+      return;
+    }
+
+    var html =
+      metric('Provider', data.provider || '--') +
+      metric('Server', data.server || 'unknown') +
+      metric('Endpoint', data.base_url || '--') +
+      metric('Healthy', data.healthy ? 'Yes' : 'No') +
+      metric('Latency', (data.latency_ms || '--') + ' ms');
+
+    if (data.consecutive_failures > 0) {
+      html += metric('Recent Failures', data.consecutive_failures);
+    }
+
+    body.innerHTML = html;
+    addLog('Provider: ' + data.provider + ' healthy, ' + (data.latency_ms || '--') + 'ms');
+  }
+
+  function renderGateway(data) {
+    var body = document.getElementById(cards.gateway.body);
+    setStatus('gateway', data.status);
+
+    if (data.status === 'error') {
+      body.innerHTML = '<div class="error-msg">' + esc(data.error || 'Gateway unreachable') + '</div>';
+      addLog('Gateway: UNREACHABLE');
+      return;
+    }
+
+    var html =
+      metric('Status', data.gateway_ok ? 'Running' : 'Down') +
+      metric('Health Latency', (data.latency_ms || '--') + ' ms');
+
+    // Discord info
+    if (data.discord) {
+      var d = data.discord;
+      html +=
+        metric('Discord Bot', d.bot_name || '--') +
+        metric('Discord Status', d.ok ? 'Connected' : 'Error') +
+        metric('Discord Latency', (d.latency_ms || '--') + ' ms');
+    }
+
+    // Sessions
+    if (data.session_count != null) {
+      html += metric('Active Sessions', data.session_count);
+    }
+
+    if (data.sessions && data.sessions.length) {
+      html += '<ul class="session-list">';
+      data.sessions.forEach(function(s) {
+        html += '<li><span>' + esc(s.key) + '</span><span>' + formatAge(s.age_seconds) + '</span></li>';
+      });
+      html += '</ul>';
+    }
+
+    body.innerHTML = html;
+    var discordMsg = data.discord ? (', Discord: ' + (data.discord.ok ? data.discord.bot_name : 'ERROR')) : '';
+    addLog('Gateway: ok' + discordMsg + ', ' + (data.session_count || 0) + ' sessions');
   }
 
   function renderTunnel(data) {
     var body = document.getElementById(cards.tunnel.body);
     setStatus('tunnel', data.status);
 
-    var html = metric('Service', data.service || '--') +
-               metric('State', data.state || '--');
+    if (data.status === 'error' && data.error) {
+      body.innerHTML = '<div class="error-msg">' + esc(data.error) + '</div>';
+      addLog('Tunnel: DOWN - ' + data.error);
+      return;
+    }
 
-    if (data.port_8001) {
-      html += metric('Port 8001', data.port_8001);
+    var html =
+      metric('Host', (data.host || '--') + ':' + (data.port || '--')) +
+      metric('Reachable', data.reachable ? 'Yes' : 'No') +
+      metric('Latency', (data.latency_ms || '--') + ' ms');
+
+    if (data.service_name) {
+      html +=
+        metric('Service', data.service_name) +
+        metric('Service Active', data.service_active ? 'Yes' : 'No');
     }
 
     if (data.status === 'error') {
-      html += '<div class="error-msg">Tunnel down</div>';
+      html += '<div class="error-msg">Tunnel unreachable</div>';
       addLog('Tunnel: DOWN');
     } else if (data.status === 'degraded') {
-      html += '<div class="error-msg">Service active but port not listening</div>';
-      addLog('Tunnel: degraded (port not listening)');
+      html += '<div class="error-msg">Service active but port unreachable</div>';
+      addLog('Tunnel: degraded');
     } else {
-      addLog('Tunnel: active, port 8001 listening');
+      addLog('Tunnel: ok, ' + (data.latency_ms || '--') + 'ms');
     }
 
     body.innerHTML = html;
@@ -422,16 +500,14 @@
     fetch('/api/overview')
       .then(function(r) { return r.json(); })
       .then(function(data) {
-        // Overall badge
         $overall.className = 'badge ' + data.overall;
         $overall.textContent = data.overall.toUpperCase();
         $lastUpdate.textContent = data.timestamp || new Date().toISOString();
         $collectTime.textContent = (data.collect_time_ms || '--') + ' ms';
 
-        // Render each card
         if (data.gpu)      renderGpu(data.gpu);
-        if (data.vllm)     renderVllm(data.vllm);
-        if (data.openclaw) renderOpenclaw(data.openclaw);
+        if (data.provider) renderProvider(data.provider);
+        if (data.gateway)  renderGateway(data.gateway);
         if (data.tunnel)   renderTunnel(data.tunnel);
       })
       .catch(function(err) {
@@ -441,7 +517,6 @@
       });
   }
 
-  // Initial poll + interval
   poll();
   setInterval(poll, POLL_INTERVAL);
 

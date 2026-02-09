@@ -1,202 +1,261 @@
 """
 Data collectors for DGX Spark + OpenClaw monitoring.
 
-Each collector gathers metrics from a specific subsystem and returns
-a dict with at minimum a "status" field ("ok", "error", or "degraded").
+Pulls live data from the OpenClaw gateway's infrastructure RPC and health
+endpoints instead of doing direct SSH/systemd checks.  The gateway already
+collects provider health, tunnel status, and GPU metrics — we just reshape
+the output for the dashboard.
+
+Data sources:
+  - gateway "infrastructure" RPC → GPU, provider (llama.cpp), tunnel
+  - gateway "health" RPC → gateway status, Discord bot status, sessions
 """
 
+import json
 import subprocess
 import time
-import requests
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-DGX_HOST = "mferry@10.0.0.109"
-SSH_KEY = "/home/mferr/.ssh/nvsync.key"
-SSH_OPTS = [
-    "-i", SSH_KEY,
-    "-o", "ConnectTimeout=5",
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "BatchMode=yes",
-]
-VLLM_HEALTH_URL = "http://localhost:8001/health"
-VLLM_MODELS_URL = "http://localhost:8001/v1/models"
+OPENCLAW_DIR = "/home/mferr/openclaw"
+OPENCLAW_CLI = f"{OPENCLAW_DIR}/dist/entry.js"
+RPC_TIMEOUT = 15  # seconds for subprocess calls
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Gateway RPC helper
 # ---------------------------------------------------------------------------
 
-def _ssh_run(cmd: str, timeout: int = 10) -> tuple[int, str, str]:
-    """Run a command on the DGX over SSH.  Returns (returncode, stdout, stderr)."""
-    full_cmd = ["ssh"] + SSH_OPTS + [DGX_HOST, cmd]
-    try:
-        proc = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
-        return proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired:
-        return -1, "", "SSH command timed out"
-    except Exception as exc:
-        return -1, "", str(exc)
+def _gateway_call(method: str, probe: bool = False) -> dict | None:
+    """Call a gateway RPC method via the CLI and return parsed JSON."""
+    cmd = ["node", OPENCLAW_CLI, "gateway", "call", method]
+    if probe:
+        cmd += ["--params", '{"probe":true}']
 
-
-def _systemctl_active(service: str) -> bool:
-    """Check if a user-level systemd service is active locally."""
     try:
         proc = subprocess.run(
-            ["systemctl", "--user", "is-active", service],
-            capture_output=True, text=True, timeout=5,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=RPC_TIMEOUT,
+            cwd=OPENCLAW_DIR,
         )
-        return proc.stdout.strip() == "active"
-    except Exception:
-        return False
+        if proc.returncode != 0:
+            return None
+
+        # The CLI outputs a header line "Gateway call: <method>" then JSON
+        lines = proc.stdout.strip().split("\n")
+        json_start = next(
+            (i for i, line in enumerate(lines) if line.strip().startswith("{")),
+            None,
+        )
+        if json_start is None:
+            return None
+
+        return json.loads("\n".join(lines[json_start:]))
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+        return None
 
 
 # ---------------------------------------------------------------------------
-# Collectors
+# Individual reshaping functions (take pre-fetched RPC data)
+# ---------------------------------------------------------------------------
+
+def _reshape_gpu(infra: dict) -> dict:
+    """Reshape infrastructure GPU data for the dashboard."""
+    if not infra or "gpu" not in infra:
+        return {"status": "error", "error": "No GPU data from gateway"}
+
+    gpu_data = infra["gpu"]
+    if gpu_data.get("error"):
+        return {"status": "error", "error": gpu_data["error"]}
+
+    gpus = gpu_data.get("gpus", [])
+    if not gpus:
+        return {"status": "error", "error": "No GPUs reported"}
+
+    gpu = gpus[0]
+    util = gpu.get("utilizationPercent", 0)
+    temp = gpu.get("temperatureCelsius", 0)
+    mem_used = gpu.get("memoryUsedMB")
+    mem_total = gpu.get("memoryTotalMB")
+    mem_pct = gpu.get("memoryUtilizationPercent")
+
+    if util > 95 or (temp and temp > 90):
+        status = "degraded"
+    else:
+        status = "ok"
+
+    result = {
+        "status": status,
+        "gpu_name": gpu.get("name", "Unknown"),
+        "index": gpu.get("index", 0),
+        "utilization_pct": util,
+        "temperature_c": temp,
+        "power_w": gpu.get("powerDrawWatts"),
+        "power_limit_w": gpu.get("powerLimitWatts"),
+        "host": gpu_data.get("host", "unknown"),
+        "collected_at": gpu_data.get("collectedAt"),
+    }
+
+    # Memory fields may be None on unified-memory systems (DGX Spark)
+    if mem_used is not None and mem_total is not None:
+        result["memory_used_mb"] = mem_used
+        result["memory_total_mb"] = mem_total
+        result["memory_pct"] = mem_pct or (round(mem_used / mem_total * 100, 1) if mem_total else 0)
+    else:
+        result["memory_note"] = "Unified memory (shared CPU/GPU)"
+
+    return result
+
+
+def _reshape_provider(infra: dict) -> dict:
+    """Reshape infrastructure provider health data for the dashboard."""
+    if not infra or "providers" not in infra:
+        return {"status": "error", "error": "No provider data from gateway"}
+
+    providers = infra["providers"].get("providers", {})
+    if not providers:
+        return {"status": "error", "error": "No providers configured"}
+
+    provider_id, provider = next(iter(providers.items()))
+
+    healthy = provider.get("healthy", False)
+    status = "ok" if healthy else "error"
+
+    result = {
+        "status": status,
+        "provider": provider_id,
+        "server": "llama.cpp",
+        "base_url": provider.get("baseUrl", ""),
+        "healthy": healthy,
+        "latency_ms": provider.get("latencyMs"),
+        "consecutive_failures": provider.get("consecutiveFailures", 0),
+        "last_checked_at": provider.get("lastCheckedAt"),
+        "last_healthy_at": provider.get("lastHealthyAt"),
+    }
+
+    if provider.get("error"):
+        result["error"] = provider["error"]
+
+    return result
+
+
+def _reshape_tunnel(infra: dict) -> dict:
+    """Reshape infrastructure tunnel data for the dashboard."""
+    if not infra or "tunnels" not in infra:
+        return {"status": "error", "error": "No tunnel data from gateway"}
+
+    tunnels = infra.get("tunnels", [])
+    if not tunnels:
+        return {"status": "error", "error": "No tunnels configured"}
+
+    t = tunnels[0]
+    tunnel = t.get("tunnel", {})
+    service = t.get("service", {})
+
+    reachable = tunnel.get("reachable", False)
+    svc_active = service.get("active", False) if service else None
+
+    if reachable:
+        status = "ok"
+    elif svc_active:
+        status = "degraded"
+    else:
+        status = "error"
+
+    result = {
+        "status": status,
+        "host": tunnel.get("host", "unknown"),
+        "port": tunnel.get("port"),
+        "reachable": reachable,
+        "latency_ms": tunnel.get("latencyMs"),
+    }
+
+    if tunnel.get("error"):
+        result["error"] = tunnel["error"]
+
+    if service:
+        result["service_name"] = service.get("name")
+        result["service_active"] = svc_active
+        result["service_status"] = service.get("status")
+
+    return result
+
+
+def _reshape_gateway(health: dict) -> dict:
+    """Reshape gateway health data for the dashboard."""
+    if not health:
+        return {"status": "error", "error": "Gateway unreachable"}
+
+    result = {
+        "status": "ok" if health.get("ok") else "error",
+        "gateway_ok": health.get("ok", False),
+        "latency_ms": health.get("durationMs"),
+        "sessions": [],
+        "discord": None,
+    }
+
+    agents = health.get("agents", [])
+    if agents:
+        agent = agents[0]
+        sessions = agent.get("sessions", {})
+        result["session_count"] = sessions.get("count", 0)
+        recent = sessions.get("recent", [])
+        result["sessions"] = [
+            {
+                "key": s["key"].split(":")[-1] if ":" in s.get("key", "") else s.get("key", ""),
+                "age_seconds": s.get("age", 0) // 1000,
+            }
+            for s in recent[:5]
+        ]
+
+    discord = health.get("channels", {}).get("discord", {})
+    if discord:
+        probe = discord.get("probe", {})
+        bot = probe.get("bot", {})
+        result["discord"] = {
+            "ok": probe.get("ok", False),
+            "bot_name": bot.get("username", "Unknown"),
+            "bot_id": bot.get("id"),
+            "latency_ms": probe.get("elapsedMs"),
+        }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public API (individual collectors for per-endpoint use)
 # ---------------------------------------------------------------------------
 
 def collect_gpu_stats() -> dict:
-    """SSH to DGX and parse nvidia-smi output.
+    return _reshape_gpu(_gateway_call("infrastructure"))
 
-    Returns GPU utilization, memory usage, temperature, and power draw.
-    """
-    query = "utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,name,driver_version"
-    rc, stdout, stderr = _ssh_run(
-        f"nvidia-smi --query-gpu={query} --format=csv,noheader,nounits"
-    )
+def collect_provider_status() -> dict:
+    return _reshape_provider(_gateway_call("infrastructure"))
 
-    if rc != 0:
-        return {
-            "status": "error",
-            "error": stderr.strip() or "nvidia-smi failed",
-        }
-
-    try:
-        parts = [p.strip() for p in stdout.strip().split(",")]
-        gpu_util = int(parts[0])
-        mem_used = int(parts[1])
-        mem_total = int(parts[2])
-        temp = int(parts[3])
-        power = float(parts[4])
-        name = parts[5]
-        driver = parts[6]
-
-        # Determine health colour
-        if gpu_util > 95 or temp > 90:
-            status = "degraded"
-        else:
-            status = "ok"
-
-        return {
-            "status": status,
-            "gpu_name": name,
-            "driver_version": driver,
-            "utilization_pct": gpu_util,
-            "memory_used_mb": mem_used,
-            "memory_total_mb": mem_total,
-            "memory_pct": round(mem_used / mem_total * 100, 1) if mem_total else 0,
-            "temperature_c": temp,
-            "power_w": power,
-        }
-    except Exception as exc:
-        return {"status": "error", "error": f"Parse error: {exc}", "raw": stdout}
-
-
-def collect_vllm_status() -> dict:
-    """Check vLLM health through the SSH tunnel (localhost:8001)."""
-    result: dict = {"status": "error"}
-    try:
-        resp = requests.get(VLLM_HEALTH_URL, timeout=5)
-        if resp.status_code == 200:
-            result["status"] = "ok"
-            result["health"] = "healthy"
-        else:
-            result["health"] = f"HTTP {resp.status_code}"
-    except requests.ConnectionError:
-        result["error"] = "Connection refused (tunnel down?)"
-        return result
-    except requests.Timeout:
-        result["error"] = "Health check timed out"
-        return result
-
-    # Also grab model info if healthy
-    try:
-        resp = requests.get(VLLM_MODELS_URL, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            models = data.get("data", [])
-            if models:
-                result["model"] = models[0].get("id", "unknown")
-                result["model_count"] = len(models)
-    except Exception:
-        pass  # model info is optional
-
-    return result
-
-
-def collect_openclaw_status() -> dict:
-    """Check if the OpenClaw gateway systemd service is running."""
-    active = _systemctl_active("openclaw-gateway.service")
-    result = {
-        "status": "ok" if active else "error",
-        "service": "openclaw-gateway.service",
-        "state": "active" if active else "inactive",
-    }
-
-    # Try to get recent log entries
-    if active:
-        try:
-            proc = subprocess.run(
-                ["journalctl", "--user", "-u", "openclaw-gateway.service",
-                 "-n", "5", "--no-pager", "-o", "short-iso"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if proc.returncode == 0:
-                result["recent_logs"] = proc.stdout.strip().split("\n")
-        except Exception:
-            pass
-
-    return result
-
+def collect_gateway_status() -> dict:
+    return _reshape_gateway(_gateway_call("health"))
 
 def collect_tunnel_status() -> dict:
-    """Check if the SSH tunnel systemd service is running."""
-    active = _systemctl_active("dgx-spark-tunnel.service")
-    result = {
-        "status": "ok" if active else "error",
-        "service": "dgx-spark-tunnel.service",
-        "state": "active" if active else "inactive",
-    }
-
-    # Verify tunnel is actually passing traffic by checking port
-    if active:
-        try:
-            proc = subprocess.run(
-                ["ss", "-tlnp"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if "8001" in proc.stdout:
-                result["port_8001"] = "listening"
-            else:
-                result["port_8001"] = "not listening"
-                result["status"] = "degraded"
-        except Exception:
-            pass
-
-    return result
+    return _reshape_tunnel(_gateway_call("infrastructure"))
 
 
 def collect_all() -> dict:
-    """Run every collector and return combined results with a timestamp."""
+    """Fetch all data with just 2 RPC calls and return combined results."""
     t0 = time.time()
 
-    gpu = collect_gpu_stats()
-    vllm = collect_vllm_status()
-    openclaw = collect_openclaw_status()
-    tunnel = collect_tunnel_status()
+    # Only 2 RPC calls total — share the infrastructure result across cards
+    infra = _gateway_call("infrastructure")
+    health = _gateway_call("health")
 
-    statuses = [gpu["status"], vllm["status"], openclaw["status"], tunnel["status"]]
+    gpu = _reshape_gpu(infra)
+    provider = _reshape_provider(infra)
+    tunnel = _reshape_tunnel(infra)
+    gateway = _reshape_gateway(health)
+
+    statuses = [gpu["status"], provider["status"], gateway["status"], tunnel["status"]]
     if all(s == "ok" for s in statuses):
         overall = "ok"
     elif any(s == "error" for s in statuses):
@@ -209,7 +268,7 @@ def collect_all() -> dict:
         "overall": overall,
         "collect_time_ms": round((time.time() - t0) * 1000),
         "gpu": gpu,
-        "vllm": vllm,
-        "openclaw": openclaw,
+        "provider": provider,
+        "gateway": gateway,
         "tunnel": tunnel,
     }

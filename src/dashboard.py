@@ -2,15 +2,15 @@
 """
 DGX OpenClaw Dashboard  --  Monitoring server for DGX Spark + OpenClaw infra.
 
-Serves a web dashboard on port 8080 and exposes JSON API endpoints that
-collect live metrics from the DGX Spark (GPU stats via SSH), vLLM (HTTP
-health check via SSH tunnel), OpenClaw gateway, and the SSH tunnel service.
+Serves a web dashboard on port 8080 and exposes JSON API endpoints that pull
+live metrics from the OpenClaw gateway's infrastructure RPC (GPU, provider
+health, tunnel status) and health endpoint (gateway + Discord status).
 
 Usage:
     python3 src/dashboard.py            # starts on 0.0.0.0:8080
     python3 src/dashboard.py --port 9090
 
-No external dependencies beyond stdlib + requests.
+No external dependencies beyond stdlib.
 """
 
 import argparse
@@ -26,8 +26,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.api.collectors import (
     collect_gpu_stats,
-    collect_vllm_status,
-    collect_openclaw_status,
+    collect_provider_status,
+    collect_gateway_status,
     collect_tunnel_status,
     collect_all,
 )
@@ -54,73 +54,59 @@ def _read_index() -> bytes:
 class DashboardHandler(BaseHTTPRequestHandler):
     """Handles both the static dashboard page and /api/* JSON endpoints."""
 
-    # Suppress default access log noise (we print our own summary)
     def log_message(self, fmt, *args):
         sys.stderr.write(
             f"[dashboard] {self.address_string()} - {fmt % args}\n"
         )
 
-    # -- routing --
-
     def do_GET(self):
-        path = self.path.split("?")[0]  # strip query params
+        path = self.path.split("?")[0]
 
         routes = {
-            "/":            self._serve_index,
-            "/index.html":  self._serve_index,
-            "/api/gpu":     self._api_gpu,
-            "/api/vllm":    self._api_vllm,
-            "/api/openclaw": self._api_openclaw,
-            "/api/tunnel":  self._api_tunnel,
-            "/api/overview": self._api_overview,
+            "/":              self._serve_index,
+            "/index.html":    self._serve_index,
+            "/api/gpu":       self._api_gpu,
+            "/api/provider":  self._api_provider,
+            "/api/gateway":   self._api_gateway,
+            "/api/tunnel":    self._api_tunnel,
+            "/api/overview":  self._api_overview,
         }
 
         handler = routes.get(path)
         if handler:
             handler()
         else:
-            # Try serving static files from public/
             self._serve_static(path)
-
-    # -- static files --
 
     def _serve_index(self):
         self._respond(200, "text/html", _read_index())
 
     def _serve_static(self, path: str):
-        """Serve files under public/ with basic MIME support."""
         safe = path.lstrip("/")
         target = (PUBLIC_DIR / safe).resolve()
-
-        # Prevent directory traversal
         if not str(target).startswith(str(PUBLIC_DIR)):
             self._respond(403, "text/plain", b"Forbidden")
             return
-
         if target.is_file():
             mime = _guess_mime(target.suffix)
             self._respond(200, mime, target.read_bytes())
         else:
             self._respond(404, "text/plain", b"Not found")
 
-    # -- API endpoints --
-
     def _api_gpu(self):
         self._json_response(collect_gpu_stats())
 
-    def _api_vllm(self):
-        self._json_response(collect_vllm_status())
+    def _api_provider(self):
+        self._json_response(collect_provider_status())
 
-    def _api_openclaw(self):
-        self._json_response(collect_openclaw_status())
+    def _api_gateway(self):
+        self._json_response(collect_gateway_status())
 
     def _api_tunnel(self):
         self._json_response(collect_tunnel_status())
 
     def _api_overview(self):
         self._json_response(collect_all())
-
-    # -- helpers --
 
     def _json_response(self, data: dict, status: int = 200):
         body = json.dumps(data, indent=2).encode()
@@ -160,11 +146,12 @@ def main():
     server = HTTPServer((args.host, args.port), DashboardHandler)
     print(f"[dashboard] Serving on http://{args.host}:{args.port}")
     print(f"[dashboard] Public dir: {PUBLIC_DIR}")
+    print(f"[dashboard] Data source: OpenClaw gateway RPC (ws://127.0.0.1:18789)")
     print(f"[dashboard] API endpoints:")
-    print(f"  GET /api/gpu       - GPU stats via SSH nvidia-smi")
-    print(f"  GET /api/vllm      - vLLM health (localhost:8001)")
-    print(f"  GET /api/openclaw  - OpenClaw gateway service status")
-    print(f"  GET /api/tunnel    - SSH tunnel service status")
+    print(f"  GET /api/gpu       - GPU metrics (via gateway infra RPC)")
+    print(f"  GET /api/provider  - Model provider health (via gateway infra RPC)")
+    print(f"  GET /api/gateway   - Gateway + Discord status (via gateway health RPC)")
+    print(f"  GET /api/tunnel    - SSH tunnel status (via gateway infra RPC)")
     print(f"  GET /api/overview  - Combined status of all systems")
     print()
 

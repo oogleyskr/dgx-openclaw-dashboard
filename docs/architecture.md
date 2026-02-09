@@ -4,8 +4,8 @@
 
 The DGX OpenClaw Dashboard is a lightweight monitoring tool that provides
 real-time visibility into the DGX Spark + OpenClaw inference infrastructure.
-It runs on the WSL host and reaches out to the various subsystems to collect
-status information.
+It runs on the WSL host and pulls all monitoring data from the OpenClaw
+gateway's built-in infrastructure RPC — no direct SSH or systemd calls.
 
 ## Infrastructure Layout
 
@@ -13,31 +13,28 @@ status information.
 +-------------------------------+
 |  WSL2 (Ubuntu on Windows)     |
 |                               |
-|  +-------------------------+  |       SSH (port 22)
-|  | Dashboard (port 8080)   |----------+
-|  | - Python http.server    |  |       |
-|  | - API endpoints         |  |       |
-|  | - Serves HTML/JS UI     |  |       |
-|  +----------+--------------+  |       |
-|             |                 |       |
-|  +----------v--------------+  |       |
-|  | SSH Tunnel Service      |  |       |
-|  | dgx-spark-tunnel.service|  |       |
-|  | localhost:8001 ---------)--------->+
-|  +-------------------------+  |       |
-|                               |       |
-|  +-------------------------+  |       |
-|  | OpenClaw Gateway        |  |       |
-|  | openclaw-gateway.service|  |       |
+|  +-------------------------+  |
+|  | Dashboard (port 8080)   |  |
+|  | - Python http.server    |  |
+|  | - API endpoints         |  |
+|  | - Serves HTML/JS UI     |  |
+|  +----------+--------------+  |
+|             | RPC calls       |
+|  +----------v--------------+  |       SSH (port 22)
+|  | OpenClaw Gateway        |----------+
+|  | ws://127.0.0.1:18789    |  |       |
 |  | (Agent: BillBot)        |  |       |
-|  +----------+--------------+  |       |
-|             |                 |       |
-|  +----------v--------------+  |       |
-|  | openclaw-trtllm-proxy   |  |       |
-|  | port 8000               |  |       |
-|  | Strips unsupported      |  |       |
-|  | params, translates      |  |       |
-|  | Responses -> Chat API   |  |       |
+|  |                         |  |       |
+|  | Built-in monitors:      |  |       |
+|  |  - Provider health      |  |       |
+|  |  - Tunnel monitor       |  |       |
+|  |  - GPU metrics (SSH)  --------+    |
+|  +----------+--------------+  |  |    |
+|             |                 |  |    |
+|  +----------v--------------+  |  |    |
+|  | SSH Tunnel Service      |  |  |    |
+|  | dgx-spark-tunnel.service|  |  |    |
+|  | localhost:8001 ---------)--+--+--->+
 |  +-------------------------+  |       |
 +-------------------------------+       |
                                         |
@@ -47,8 +44,9 @@ status information.
 |  Ubuntu 24.04                             |
 |                                           |
 |  +-------------------------------------+ |
-|  | vLLM                                | |
-|  | Qwen3-Coder-Next-AWQ-4bit           | |
+|  | llama.cpp (llama-server)            | |
+|  | Qwen3-Coder-Next-Q4_K_M GGUF       | |
+|  | --ctx-size 131072                   | |
 |  | Listening on port 8000              | |
 |  +-------------------------------------+ |
 |                                           |
@@ -58,53 +56,43 @@ status information.
 
 ## Data Flow
 
-### 1. GPU Stats (`GET /api/gpu`)
+The dashboard makes **2 RPC calls** to the OpenClaw gateway per poll cycle:
+
+### 1. Infrastructure RPC (`gateway call infrastructure`)
+
+Returns GPU, provider health, and tunnel status in a single response.
 
 ```
-Dashboard --SSH--> DGX Spark --nvidia-smi--> parse CSV output
-                   mferry@10.0.0.109
+Dashboard --subprocess--> node dist/entry.js gateway call infrastructure
+                              |
+                              +-- providers: health check results (HTTP probe)
+                              +-- tunnels: TCP reachability + systemd status
+                              +-- gpu: nvidia-smi over SSH to DGX
 ```
 
-The dashboard opens an SSH connection to the DGX Spark and runs
-`nvidia-smi --query-gpu=... --format=csv`. The CSV output is parsed
-into structured fields: utilization, memory, temperature, and power.
+### 2. Health RPC (`gateway call health`)
 
-### 2. vLLM Health (`GET /api/vllm`)
+Returns gateway status, Discord connection, and session info.
 
 ```
-Dashboard --HTTP--> localhost:8001/health --SSH tunnel--> DGX:8000/health
-          --HTTP--> localhost:8001/v1/models              DGX:8000/v1/models
+Dashboard --subprocess--> node dist/entry.js gateway call health
+                              |
+                              +-- ok: boolean gateway health
+                              +-- channels.discord: bot connection + probe
+                              +-- agents[].sessions: active session list
 ```
 
-The SSH tunnel service forwards `localhost:8001` to the DGX port 8000
-where vLLM is listening. The dashboard checks the `/health` endpoint
-and optionally queries `/v1/models` for loaded model information.
+### Dashboard API Endpoints
 
-### 3. OpenClaw Gateway (`GET /api/openclaw`)
+| Endpoint          | Source RPC       | Data                                   |
+|-------------------|------------------|----------------------------------------|
+| `GET /api/gpu`    | infrastructure   | GPU name, util%, temp, power           |
+| `GET /api/provider`| infrastructure  | llama.cpp health, latency, failures    |
+| `GET /api/gateway`| health           | Gateway status, Discord, sessions      |
+| `GET /api/tunnel` | infrastructure   | TCP reachability, service status       |
+| `GET /api/overview`| both            | All of the above, combined             |
 
-```
-Dashboard --systemctl--> openclaw-gateway.service status
-          --journalctl--> recent log entries
-```
-
-Checked locally via `systemctl --user is-active`. If active, the
-dashboard also pulls the 5 most recent journal entries for display.
-
-### 4. SSH Tunnel (`GET /api/tunnel`)
-
-```
-Dashboard --systemctl--> dgx-spark-tunnel.service status
-          --ss--> verify port 8001 is listening
-```
-
-Checked locally via systemctl. Additionally verifies that port 8001
-is actually listening with `ss -tlnp`, catching the case where the
-service is "active" but the tunnel has dropped.
-
-### 5. Combined Overview (`GET /api/overview`)
-
-Runs all four collectors and returns a single JSON payload with an
-`overall` status derived from the individual results:
+### Overall Status Logic
 
 - **ok** -- all systems healthy
 - **degraded** -- at least one system is degraded, none in error
@@ -112,15 +100,14 @@ Runs all four collectors and returns a single JSON payload with an
 
 ## Technology Stack
 
-| Component         | Technology                          |
-|-------------------|-------------------------------------|
-| Server            | Python `http.server` (stdlib)       |
-| HTTP client       | `requests` library                  |
-| SSH               | `subprocess` calling `ssh` CLI      |
-| Service checks    | `systemctl --user`                  |
-| Frontend          | Vanilla HTML/CSS/JS                 |
-| Styling           | Dark theme, CSS Grid, responsive    |
-| Auto-refresh      | `setInterval` + `fetch()` (10s)     |
+| Component         | Technology                              |
+|-------------------|-----------------------------------------|
+| Server            | Python `http.server` (stdlib)           |
+| Data source       | OpenClaw gateway RPC (via CLI subprocess)|
+| Frontend          | Vanilla HTML/CSS/JS                     |
+| Styling           | Dark theme, CSS Grid, responsive        |
+| Auto-refresh      | `setInterval` + `fetch()` (10s)         |
+| Dependencies      | Python stdlib only (no pip packages)    |
 
 ## File Structure
 
@@ -130,7 +117,7 @@ dgx-openclaw-dashboard/
     dashboard.py            Main server (port 8080)
     api/
       __init__.py
-      collectors.py         Data collection functions
+      collectors.py         Data reshaping from gateway RPC
   public/
     index.html              Dashboard web UI
   docs/
