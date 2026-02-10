@@ -21,6 +21,7 @@
     --yellow:    #d29922;
     --blue:      #58a6ff;
     --cyan:      #39d353;
+    --purple:    #bc8cff;
     --radius:    8px;
   }
 
@@ -125,7 +126,7 @@
   .metric .value { font-weight: 500; font-variant-numeric: tabular-nums; }
 
   /* ------------------------------------------------------------------ */
-  /* Progress bar (for GPU / memory)                                     */
+  /* Progress bar (for GPU / memory utilization)                         */
   /* ------------------------------------------------------------------ */
   .bar-wrap {
     width: 100%;
@@ -145,6 +146,52 @@
   .bar-fill.red    { background: var(--red); }
 
   /* ------------------------------------------------------------------ */
+  /* Multimodal service grid (compact table within a card)               */
+  /* ------------------------------------------------------------------ */
+  .svc-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .svc-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: rgba(48,54,61,0.3);
+    border-radius: 6px;
+    font-size: 13px;
+  }
+  .svc-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .svc-dot.ok      { background: var(--green); }
+  .svc-dot.error   { background: var(--red); }
+  .svc-dot.loading { background: var(--yellow); }
+  .svc-name {
+    font-weight: 600;
+    color: var(--text);
+    min-width: 72px;
+  }
+  .svc-model {
+    color: var(--text-dim);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .svc-port {
+    color: var(--text-dim);
+    font-size: 11px;
+    margin-left: auto;
+    flex-shrink: 0;
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Session list                                                        */
   /* ------------------------------------------------------------------ */
   .session-list {
@@ -161,7 +208,7 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Logs                                                                */
+  /* Logs (activity feed)                                                */
   /* ------------------------------------------------------------------ */
   .log-list {
     list-style: none;
@@ -202,13 +249,14 @@
   @media (max-width: 600px) {
     .grid { padding: 12px; gap: 12px; grid-template-columns: 1fr; }
     .header { flex-direction: column; gap: 4px; text-align: center; }
+    .svc-grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
 <body>
 
 <!-- ================================================================== -->
-<!-- Header                                                              -->
+<!-- Header — overall status badge, last update time, poll duration      -->
 <!-- ================================================================== -->
 <header class="header">
   <h1>DGX OpenClaw Dashboard</h1>
@@ -220,14 +268,14 @@
 </header>
 
 <!-- ================================================================== -->
-<!-- Cards grid                                                          -->
+<!-- Cards grid — 6 monitoring cards + activity log                      -->
 <!-- ================================================================== -->
 <main class="grid">
 
-  <!-- GPU Stats -->
+  <!-- Card 1: DGX Spark GPU (remote, via gateway RPC) -->
   <section class="card loading" id="card-gpu">
     <div class="card-title">
-      GPU Stats
+      DGX Spark GPU
       <span class="badge loading" id="gpu-badge">--</span>
     </div>
     <div id="gpu-body">
@@ -235,7 +283,18 @@
     </div>
   </section>
 
-  <!-- Model Provider -->
+  <!-- Card 2: Local RTX 3090 GPU (local nvidia-smi) -->
+  <section class="card loading" id="card-local-gpu">
+    <div class="card-title">
+      RTX 3090 GPU
+      <span class="badge loading" id="local-gpu-badge">--</span>
+    </div>
+    <div id="local-gpu-body">
+      <div class="metric"><span class="label">Loading...</span></div>
+    </div>
+  </section>
+
+  <!-- Card 3: Model Provider / llama.cpp (via gateway RPC) -->
   <section class="card loading" id="card-provider">
     <div class="card-title">
       Model Server (llama.cpp)
@@ -246,7 +305,7 @@
     </div>
   </section>
 
-  <!-- OpenClaw Gateway -->
+  <!-- Card 4: OpenClaw Gateway + Discord (via gateway RPC) -->
   <section class="card loading" id="card-gateway">
     <div class="card-title">
       OpenClaw Gateway
@@ -257,7 +316,7 @@
     </div>
   </section>
 
-  <!-- SSH Tunnel -->
+  <!-- Card 5: SSH Tunnel (via gateway RPC) -->
   <section class="card loading" id="card-tunnel">
     <div class="card-title">
       SSH Tunnel
@@ -268,7 +327,18 @@
     </div>
   </section>
 
-  <!-- Recent Activity / Logs -->
+  <!-- Card 6: Multimodal Services (local HTTP health checks) — full width -->
+  <section class="card loading" id="card-multimodal" style="grid-column: 1 / -1;">
+    <div class="card-title">
+      Multimodal Services (RTX 3090)
+      <span class="badge loading" id="multimodal-badge">--</span>
+    </div>
+    <div id="multimodal-body">
+      <div class="metric"><span class="label">Loading...</span></div>
+    </div>
+  </section>
+
+  <!-- Activity log — recent status changes (full width) -->
   <section class="card" id="card-activity" style="grid-column: 1 / -1;">
     <div class="card-title">Recent Activity</div>
     <ul class="log-list" id="activity-log">
@@ -279,38 +349,50 @@
 </main>
 
 <footer class="footer">
-  DGX Spark (NVIDIA GB10) &middot; 128 GB unified LPDDR5x &middot; ARM64 &middot; Ubuntu 24.04
-  &middot; Data via OpenClaw Gateway RPC
+  DGX Spark (NVIDIA GB10) &middot; 128 GB unified LPDDR5x &middot; ARM64
+  &nbsp;|&nbsp;
+  RTX 3090 (24 GB GDDR6X) &middot; Multimodal AI Services
+  &nbsp;|&nbsp;
+  Data via OpenClaw Gateway RPC + Local Probes
 </footer>
 
 <!-- ================================================================== -->
-<!-- Dashboard logic                                                     -->
+<!-- Dashboard logic — polling, rendering, status computation            -->
 <!-- ================================================================== -->
 <script>
 (function() {
   'use strict';
 
-  var POLL_INTERVAL = 10000;
-  var MAX_LOG_ENTRIES = 50;
+  // -- Configuration --
+  var POLL_INTERVAL = 10000;   // Poll every 10 seconds
+  var MAX_LOG_ENTRIES = 50;    // Max activity log entries to keep
 
+  // -- DOM references --
   var $overall    = document.getElementById('overall-badge');
   var $lastUpdate = document.getElementById('last-update');
   var $collectTime = document.getElementById('collect-time');
 
+  // Card element IDs for status/badge/body updates
   var cards = {
-    gpu:      { card: 'card-gpu',      badge: 'gpu-badge',      body: 'gpu-body' },
-    provider: { card: 'card-provider', badge: 'provider-badge', body: 'provider-body' },
-    gateway:  { card: 'card-gateway',  badge: 'gateway-badge',  body: 'gateway-body' },
-    tunnel:   { card: 'card-tunnel',   badge: 'tunnel-badge',   body: 'tunnel-body' },
+    gpu:        { card: 'card-gpu',        badge: 'gpu-badge',        body: 'gpu-body' },
+    local_gpu:  { card: 'card-local-gpu',  badge: 'local-gpu-badge',  body: 'local-gpu-body' },
+    provider:   { card: 'card-provider',   badge: 'provider-badge',   body: 'provider-body' },
+    gateway:    { card: 'card-gateway',    badge: 'gateway-badge',    body: 'gateway-body' },
+    tunnel:     { card: 'card-tunnel',     badge: 'tunnel-badge',     body: 'tunnel-body' },
+    multimodal: { card: 'card-multimodal', badge: 'multimodal-badge', body: 'multimodal-body' },
   };
 
   var activityLog = document.getElementById('activity-log');
   var logEntries = [];
 
   // ----------------------------------------------------------------
-  // Helpers
+  // Helpers — shared utility functions for rendering
   // ----------------------------------------------------------------
 
+  /**
+   * Set a card's visual status (ok/error/degraded/loading).
+   * Updates both the card border color and the badge text.
+   */
   function setStatus(cardKey, status) {
     var c = cards[cardKey];
     var el = document.getElementById(c.card);
@@ -320,21 +402,37 @@
     badge.textContent = status.toUpperCase();
   }
 
+  /**
+   * Generate a metric row (label on left, value on right).
+   * All values are HTML-escaped via esc().
+   */
   function metric(label, value) {
     return '<div class="metric"><span class="label">' + esc(label) + '</span><span class="value">' + esc(String(value)) + '</span></div>';
   }
 
+  /**
+   * Generate a progress bar with color based on percentage.
+   * Green < 70%, Yellow < 90%, Red >= 90%.
+   */
   function progressBar(pct) {
     var cls = pct < 70 ? 'green' : pct < 90 ? 'yellow' : 'red';
     return '<div class="bar-wrap"><div class="bar-fill ' + cls + '" style="width:' + Math.min(pct, 100) + '%"></div></div>';
   }
 
+  /**
+   * HTML-escape a string to prevent XSS.
+   * Uses DOM textContent → innerHTML trick for safe escaping.
+   */
   function esc(s) {
     var d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
   }
 
+  /**
+   * Add a timestamped entry to the activity log.
+   * Keeps only the most recent MAX_LOG_ENTRIES entries.
+   */
   function addLog(msg) {
     var ts = new Date().toLocaleTimeString();
     logEntries.unshift('[' + ts + '] ' + msg);
@@ -342,6 +440,10 @@
     activityLog.innerHTML = logEntries.map(function(e){ return '<li>' + esc(e) + '</li>'; }).join('');
   }
 
+  /**
+   * Format a duration in seconds to a human-readable string.
+   * e.g. 45 → "45s ago", 120 → "2m ago", 7200 → "2h ago"
+   */
   function formatAge(seconds) {
     if (seconds < 60) return seconds + 's ago';
     if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
@@ -350,16 +452,20 @@
   }
 
   // ----------------------------------------------------------------
-  // Renderers
+  // Renderers — one function per card, transforms JSON → HTML
   // ----------------------------------------------------------------
 
+  /**
+   * Render the DGX Spark GPU card (remote, via gateway RPC).
+   * Shows utilization, memory, temperature, and power.
+   */
   function renderGpu(data) {
     var body = document.getElementById(cards.gpu.body);
     setStatus('gpu', data.status);
 
     if (data.status === 'error') {
       body.innerHTML = '<div class="error-msg">' + esc(data.error || 'Unknown error') + '</div>';
-      addLog('GPU: error - ' + (data.error || ''));
+      addLog('DGX GPU: error - ' + (data.error || ''));
       return;
     }
 
@@ -386,9 +492,57 @@
     }
 
     body.innerHTML = html;
-    addLog('GPU: ' + (data.utilization_pct || 0) + '% util, ' + (data.temperature_c || '--') + 'C');
+    addLog('DGX GPU: ' + (data.utilization_pct || 0) + '% util, ' + (data.temperature_c || '--') + 'C');
   }
 
+  /**
+   * Render the local RTX 3090 GPU card (local nvidia-smi).
+   * Shows VRAM usage (critical for multimodal services), utilization,
+   * temperature, and power draw.
+   */
+  function renderLocalGpu(data) {
+    var body = document.getElementById(cards.local_gpu.body);
+    setStatus('local_gpu', data.status);
+
+    if (data.status === 'error') {
+      body.innerHTML = '<div class="error-msg">' + esc(data.error || 'nvidia-smi unavailable') + '</div>';
+      addLog('RTX 3090: error - ' + (data.error || ''));
+      return;
+    }
+
+    var html =
+      metric('GPU', data.gpu_name || '--') +
+      metric('Utilization', (data.utilization_pct || 0) + '%') +
+      progressBar(data.utilization_pct || 0);
+
+    if (data.memory_used_mb != null) {
+      var memStr = data.memory_used_mb + ' / ' + data.memory_total_mb + ' MB (' + data.memory_pct + '%)';
+      html +=
+        metric('VRAM', memStr) +
+        progressBar(data.memory_pct);
+      if (data.memory_free_mb != null) {
+        html += metric('VRAM Free', data.memory_free_mb + ' MB');
+      }
+    }
+
+    html += metric('Temperature', (data.temperature_c || '--') + ' C');
+
+    if (data.power_w != null) {
+      var powerStr = data.power_w + ' W';
+      if (data.power_limit_w) powerStr += ' / ' + data.power_limit_w + ' W';
+      html += metric('Power', powerStr);
+    }
+
+    body.innerHTML = html;
+    addLog('RTX 3090: ' + (data.utilization_pct || 0) + '% util, ' +
+           (data.memory_used_mb || '--') + '/' + (data.memory_total_mb || '--') + ' MB VRAM, ' +
+           (data.temperature_c || '--') + 'C');
+  }
+
+  /**
+   * Render the model provider card (llama.cpp on DGX).
+   * Shows health status, endpoint, latency, and failure count.
+   */
   function renderProvider(data) {
     var body = document.getElementById(cards.provider.body);
     setStatus('provider', data.status);
@@ -417,6 +571,10 @@
     addLog('Provider: ' + data.provider + ' healthy, ' + (data.latency_ms || '--') + 'ms');
   }
 
+  /**
+   * Render the OpenClaw gateway card.
+   * Shows gateway health, Discord bot status, and recent sessions.
+   */
   function renderGateway(data) {
     var body = document.getElementById(cards.gateway.body);
     setStatus('gateway', data.status);
@@ -431,7 +589,7 @@
       metric('Status', data.gateway_ok ? 'Running' : 'Down') +
       metric('Health Latency', (data.latency_ms || '--') + ' ms');
 
-    // Discord info
+    // Discord bot connection info
     if (data.discord) {
       var d = data.discord;
       html +=
@@ -440,7 +598,7 @@
         metric('Discord Latency', (d.latency_ms || '--') + ' ms');
     }
 
-    // Sessions
+    // Active agent sessions
     if (data.session_count != null) {
       html += metric('Active Sessions', data.session_count);
     }
@@ -458,6 +616,10 @@
     addLog('Gateway: ok' + discordMsg + ', ' + (data.session_count || 0) + ' sessions');
   }
 
+  /**
+   * Render the SSH tunnel card.
+   * Shows host/port, reachability, latency, and systemd service status.
+   */
   function renderTunnel(data) {
     var body = document.getElementById(cards.tunnel.body);
     setStatus('tunnel', data.status);
@@ -492,23 +654,88 @@
     body.innerHTML = html;
   }
 
+  /**
+   * Render the multimodal services card.
+   * Shows a compact 2-column grid of all 6 services with status dots,
+   * service names, ports, and loaded model names.
+   */
+  function renderMultimodal(data) {
+    var body = document.getElementById(cards.multimodal.body);
+    setStatus('multimodal', data.status);
+
+    // Set badge to show count like "6/6 UP"
+    var badge = document.getElementById(cards.multimodal.badge);
+    badge.textContent = (data.services_up || 0) + '/' + (data.services_total || 0) + ' UP';
+
+    if (data.status === 'error' && !data.services) {
+      body.innerHTML = '<div class="error-msg">All services down</div>';
+      addLog('Multimodal: ALL DOWN');
+      return;
+    }
+
+    // Summary row
+    var html = metric('Services Online', (data.services_up || 0) + ' / ' + (data.services_total || 0));
+
+    // Service grid — 2 columns of service items with status dots
+    if (data.services) {
+      html += '<div class="svc-grid">';
+
+      // Define display order and friendly labels
+      var order = [
+        { key: 'stt',        label: 'STT' },
+        { key: 'vision',     label: 'Vision' },
+        { key: 'tts',        label: 'TTS' },
+        { key: 'imagegen',   label: 'ImageGen' },
+        { key: 'embeddings', label: 'Embed' },
+        { key: 'docutils',   label: 'DocParse' },
+      ];
+
+      order.forEach(function(item) {
+        var svc = data.services[item.key];
+        if (!svc) return;
+        var dotCls = svc.status === 'ok' ? 'ok' : svc.status === 'loading' ? 'loading' : 'error';
+        var modelText = svc.model ? svc.model.split('/').pop() : '--';
+        html +=
+          '<div class="svc-item">' +
+            '<span class="svc-dot ' + dotCls + '"></span>' +
+            '<span class="svc-name">' + esc(item.label) + '</span>' +
+            '<span class="svc-model" title="' + esc(svc.model || '') + '">' + esc(modelText) + '</span>' +
+            '<span class="svc-port">:' + svc.port + '</span>' +
+          '</div>';
+      });
+
+      html += '</div>';
+    }
+
+    body.innerHTML = html;
+    addLog('Multimodal: ' + (data.services_up || 0) + '/' + (data.services_total || 0) + ' services up');
+  }
+
   // ----------------------------------------------------------------
-  // Polling
+  // Polling — fetch /api/overview every POLL_INTERVAL ms
   // ----------------------------------------------------------------
 
+  /**
+   * Fetch the combined overview endpoint and render all cards.
+   * On error, shows OFFLINE in the overall badge.
+   */
   function poll() {
     fetch('/api/overview')
       .then(function(r) { return r.json(); })
       .then(function(data) {
+        // Update overall status badge
         $overall.className = 'badge ' + data.overall;
         $overall.textContent = data.overall.toUpperCase();
         $lastUpdate.textContent = data.timestamp || new Date().toISOString();
         $collectTime.textContent = (data.collect_time_ms || '--') + ' ms';
 
-        if (data.gpu)      renderGpu(data.gpu);
-        if (data.provider) renderProvider(data.provider);
-        if (data.gateway)  renderGateway(data.gateway);
-        if (data.tunnel)   renderTunnel(data.tunnel);
+        // Render each card from the overview response
+        if (data.gpu)        renderGpu(data.gpu);
+        if (data.local_gpu)  renderLocalGpu(data.local_gpu);
+        if (data.provider)   renderProvider(data.provider);
+        if (data.gateway)    renderGateway(data.gateway);
+        if (data.tunnel)     renderTunnel(data.tunnel);
+        if (data.multimodal) renderMultimodal(data.multimodal);
       })
       .catch(function(err) {
         $overall.className = 'badge error';
@@ -517,6 +744,7 @@
       });
   }
 
+  // Start polling immediately, then repeat on interval
   poll();
   setInterval(poll, POLL_INTERVAL);
 

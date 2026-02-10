@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
 """
-DGX OpenClaw Dashboard  --  Monitoring server for DGX Spark + OpenClaw infra.
+DGX OpenClaw Dashboard — Monitoring server for the full inference stack.
 
-Serves a web dashboard on port 8080 and exposes JSON API endpoints that pull
-live metrics from the OpenClaw gateway's infrastructure RPC (GPU, provider
-health, tunnel status) and health endpoint (gateway + Discord status).
+Serves a web dashboard on port 8080 and exposes JSON API endpoints that
+pull live metrics from multiple sources:
+
+  1. OpenClaw gateway RPC (via subprocess → WebSocket at ws://127.0.0.1:18789)
+     - DGX Spark GPU stats (remote, nvidia-smi via SSH)
+     - Model provider health (llama.cpp on DGX)
+     - SSH tunnel status
+     - Gateway + Discord bot status
+
+  2. Local nvidia-smi (direct subprocess)
+     - RTX 3090 GPU: utilization, temperature, power, VRAM
+
+  3. Local HTTP health endpoints (multimodal AI services)
+     - 6 FastAPI services on ports 8101-8106 (STT, Vision, TTS, ImageGen,
+       Embeddings, DocParse)
 
 Usage:
     python3 src/dashboard.py            # starts on 0.0.0.0:8080
     python3 src/dashboard.py --port 9090
 
-No external dependencies beyond stdlib.
+No external dependencies beyond Python stdlib.
 """
 
 import argparse
@@ -29,6 +41,8 @@ from src.api.collectors import (
     collect_provider_status,
     collect_gateway_status,
     collect_tunnel_status,
+    collect_local_gpu_stats,
+    collect_multimodal_status,
     collect_all,
 )
 
@@ -52,24 +66,41 @@ def _read_index() -> bytes:
 # ---------------------------------------------------------------------------
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    """Handles both the static dashboard page and /api/* JSON endpoints."""
+    """
+    HTTP request handler for the dashboard.
+
+    Routes:
+      /                 → Dashboard HTML page
+      /api/gpu          → DGX Spark GPU stats (via gateway RPC)
+      /api/provider     → llama.cpp health (via gateway RPC)
+      /api/gateway      → Gateway + Discord status (via gateway RPC)
+      /api/tunnel       → SSH tunnel status (via gateway RPC)
+      /api/local-gpu    → Local RTX 3090 GPU stats (via nvidia-smi)
+      /api/multimodal   → Multimodal service health (6 services, HTTP)
+      /api/overview     → Combined status of all systems (recommended)
+      <other>           → Static file from public/ directory
+    """
 
     def log_message(self, fmt, *args):
+        """Override default logging to use a cleaner format."""
         sys.stderr.write(
             f"[dashboard] {self.address_string()} - {fmt % args}\n"
         )
 
     def do_GET(self):
+        """Route GET requests to the appropriate handler."""
         path = self.path.split("?")[0]
 
         routes = {
-            "/":              self._serve_index,
-            "/index.html":    self._serve_index,
-            "/api/gpu":       self._api_gpu,
-            "/api/provider":  self._api_provider,
-            "/api/gateway":   self._api_gateway,
-            "/api/tunnel":    self._api_tunnel,
-            "/api/overview":  self._api_overview,
+            "/":                self._serve_index,
+            "/index.html":      self._serve_index,
+            "/api/gpu":         self._api_gpu,
+            "/api/provider":    self._api_provider,
+            "/api/gateway":     self._api_gateway,
+            "/api/tunnel":      self._api_tunnel,
+            "/api/local-gpu":   self._api_local_gpu,
+            "/api/multimodal":  self._api_multimodal,
+            "/api/overview":    self._api_overview,
         }
 
         handler = routes.get(path)
@@ -78,10 +109,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self._serve_static(path)
 
+    # --- Page handlers ---
+
     def _serve_index(self):
+        """Serve the main dashboard HTML page."""
         self._respond(200, "text/html", _read_index())
 
     def _serve_static(self, path: str):
+        """Serve static files from public/ with path traversal protection."""
         safe = path.lstrip("/")
         target = (PUBLIC_DIR / safe).resolve()
         if not str(target).startswith(str(PUBLIC_DIR)):
@@ -93,26 +128,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self._respond(404, "text/plain", b"Not found")
 
+    # --- API handlers (gateway RPC) ---
+
     def _api_gpu(self):
+        """DGX Spark GPU stats from gateway infrastructure RPC."""
         self._json_response(collect_gpu_stats())
 
     def _api_provider(self):
+        """llama.cpp model provider health from gateway infrastructure RPC."""
         self._json_response(collect_provider_status())
 
     def _api_gateway(self):
+        """Gateway + Discord bot status from gateway health RPC."""
         self._json_response(collect_gateway_status())
 
     def _api_tunnel(self):
+        """SSH tunnel status from gateway infrastructure RPC."""
         self._json_response(collect_tunnel_status())
 
+    # --- API handlers (local) ---
+
+    def _api_local_gpu(self):
+        """Local RTX 3090 GPU stats from nvidia-smi."""
+        self._json_response(collect_local_gpu_stats())
+
+    def _api_multimodal(self):
+        """Health status of all 6 multimodal AI services."""
+        self._json_response(collect_multimodal_status())
+
+    # --- API handlers (combined) ---
+
     def _api_overview(self):
+        """Combined status of all monitored systems (recommended endpoint)."""
         self._json_response(collect_all())
 
+    # --- Response helpers ---
+
     def _json_response(self, data: dict, status: int = 200):
+        """Send a JSON response with CORS headers."""
         body = json.dumps(data, indent=2).encode()
         self._respond(status, "application/json", body)
 
     def _respond(self, status: int, content_type: str, body: bytes):
+        """Send an HTTP response with standard headers."""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -122,6 +180,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def _guess_mime(suffix: str) -> str:
+    """Map file extension to MIME type for static file serving."""
     return {
         ".html": "text/html",
         ".css":  "text/css",
@@ -138,6 +197,7 @@ def _guess_mime(suffix: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
+    """Start the dashboard HTTP server."""
     parser = argparse.ArgumentParser(description="DGX OpenClaw Dashboard")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=8080, help="Listen port")
@@ -146,13 +206,18 @@ def main():
     server = HTTPServer((args.host, args.port), DashboardHandler)
     print(f"[dashboard] Serving on http://{args.host}:{args.port}")
     print(f"[dashboard] Public dir: {PUBLIC_DIR}")
-    print(f"[dashboard] Data source: OpenClaw gateway RPC (ws://127.0.0.1:18789)")
+    print(f"[dashboard] Data sources:")
+    print(f"  - OpenClaw gateway RPC (ws://127.0.0.1:18789)")
+    print(f"  - Local nvidia-smi (RTX 3090)")
+    print(f"  - Multimodal services (localhost:8101-8106)")
     print(f"[dashboard] API endpoints:")
-    print(f"  GET /api/gpu       - GPU metrics (via gateway infra RPC)")
-    print(f"  GET /api/provider  - Model provider health (via gateway infra RPC)")
-    print(f"  GET /api/gateway   - Gateway + Discord status (via gateway health RPC)")
-    print(f"  GET /api/tunnel    - SSH tunnel status (via gateway infra RPC)")
-    print(f"  GET /api/overview  - Combined status of all systems")
+    print(f"  GET /api/gpu         - DGX Spark GPU (via gateway RPC)")
+    print(f"  GET /api/provider    - llama.cpp health (via gateway RPC)")
+    print(f"  GET /api/gateway     - Gateway + Discord (via gateway RPC)")
+    print(f"  GET /api/tunnel      - SSH tunnel (via gateway RPC)")
+    print(f"  GET /api/local-gpu   - RTX 3090 GPU (local nvidia-smi)")
+    print(f"  GET /api/multimodal  - Multimodal services (local HTTP)")
+    print(f"  GET /api/overview    - Combined status (all sources)")
     print()
 
     try:

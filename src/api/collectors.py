@@ -1,34 +1,70 @@
 """
-Data collectors for DGX Spark + OpenClaw monitoring.
+Data collectors for the DGX OpenClaw Dashboard.
 
-Pulls live data from the OpenClaw gateway's infrastructure RPC and health
-endpoints instead of doing direct SSH/systemd checks.  The gateway already
-collects provider health, tunnel status, and GPU metrics — we just reshape
-the output for the dashboard.
+Pulls live data from three sources:
+  1. OpenClaw gateway RPC (infrastructure + health methods)
+     - DGX Spark GPU stats (remote, via SSH + nvidia-smi on the DGX)
+     - Model provider health (llama.cpp on DGX)
+     - SSH tunnel status
+     - Gateway + Discord bot status
+  2. Local nvidia-smi (RTX 3090 GPU on this WSL2 host)
+  3. Local HTTP health endpoints (multimodal AI services on ports 8101-8106)
 
-Data sources:
-  - gateway "infrastructure" RPC → GPU, provider (llama.cpp), tunnel
-  - gateway "health" RPC → gateway status, Discord bot status, sessions
+Architecture:
+  - The gateway RPC calls use subprocess to invoke the OpenClaw CLI, which
+    connects to the gateway's WebSocket RPC at ws://127.0.0.1:18789.
+  - Local GPU data comes from running nvidia-smi directly.
+  - Multimodal service checks use urllib to hit localhost FastAPI health endpoints.
+  - collect_all() is the recommended entry point — it makes all calls once
+    and returns a single combined response for the dashboard's /api/overview.
 """
 
 import json
 import subprocess
 import time
+import urllib.request
+import urllib.error
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Path to the OpenClaw fork on this machine (used for gateway RPC calls)
 OPENCLAW_DIR = "/home/mferr/openclaw"
 OPENCLAW_CLI = f"{OPENCLAW_DIR}/dist/entry.js"
-RPC_TIMEOUT = 15  # seconds for subprocess calls
+RPC_TIMEOUT = 15  # seconds — timeout for gateway RPC subprocess calls
 
-# ---------------------------------------------------------------------------
-# Gateway RPC helper
-# ---------------------------------------------------------------------------
+# Multimodal service definitions: name -> port
+# These are the FastAPI services running on the local RTX 3090.
+MULTIMODAL_SERVICES = {
+    "stt":        8101,   # Speech-to-Text (faster-whisper large-v3)
+    "vision":     8102,   # Vision-Language (Qwen2.5-VL-7B-AWQ)
+    "tts":        8103,   # Text-to-Speech (Kokoro-82M)
+    "imagegen":   8104,   # Image Generation (SDXL-Turbo)
+    "embeddings": 8105,   # Text Embeddings (nomic-embed-text-v1.5)
+    "docutils":   8106,   # Document Parsing (CPU-only, pymupdf)
+}
+MULTIMODAL_HEALTH_TIMEOUT = 2  # seconds — timeout per service health check
+
+
+# ===========================================================================
+# Gateway RPC helpers (for DGX Spark monitoring)
+# ===========================================================================
 
 def _gateway_call(method: str, probe: bool = False) -> dict | None:
-    """Call a gateway RPC method via the CLI and return parsed JSON."""
+    """
+    Call a gateway RPC method via the OpenClaw CLI and return parsed JSON.
+
+    The CLI outputs a header line ("Gateway call: <method>") followed by the
+    JSON response.  We skip the header and parse only the JSON portion.
+
+    Args:
+        method: RPC method name (e.g. "infrastructure", "health")
+        probe: If True, passes {"probe":true} as params (triggers live checks)
+
+    Returns:
+        Parsed JSON dict, or None on any failure (timeout, bad JSON, non-zero exit).
+    """
     cmd = ["node", OPENCLAW_CLI, "gateway", "call", method]
     if probe:
         cmd += ["--params", '{"probe":true}']
@@ -44,7 +80,7 @@ def _gateway_call(method: str, probe: bool = False) -> dict | None:
         if proc.returncode != 0:
             return None
 
-        # The CLI outputs a header line "Gateway call: <method>" then JSON
+        # Skip the CLI header line and find where JSON starts
         lines = proc.stdout.strip().split("\n")
         json_start = next(
             (i for i, line in enumerate(lines) if line.strip().startswith("{")),
@@ -58,12 +94,22 @@ def _gateway_call(method: str, probe: bool = False) -> dict | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Individual reshaping functions (take pre-fetched RPC data)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Reshaping functions — transform raw RPC data into dashboard card format
+# ===========================================================================
 
 def _reshape_gpu(infra: dict) -> dict:
-    """Reshape infrastructure GPU data for the dashboard."""
+    """
+    Extract DGX Spark GPU stats from the infrastructure RPC response.
+
+    The gateway runs 'nvidia-smi' on the DGX via SSH and returns structured
+    GPU data.  We pull the first GPU and compute a status indicator.
+
+    Status logic:
+      - "degraded" if utilization > 95% or temperature > 90C
+      - "ok" otherwise
+      - "error" if data is missing or malformed
+    """
     if not infra or "gpu" not in infra:
         return {"status": "error", "error": "No GPU data from gateway"}
 
@@ -99,7 +145,8 @@ def _reshape_gpu(infra: dict) -> dict:
         "collected_at": gpu_data.get("collectedAt"),
     }
 
-    # Memory fields may be None on unified-memory systems (DGX Spark)
+    # Memory fields may be None on unified-memory systems (DGX Spark has
+    # 128 GB unified LPDDR5x shared between CPU and GPU)
     if mem_used is not None and mem_total is not None:
         result["memory_used_mb"] = mem_used
         result["memory_total_mb"] = mem_total
@@ -111,7 +158,12 @@ def _reshape_gpu(infra: dict) -> dict:
 
 
 def _reshape_provider(infra: dict) -> dict:
-    """Reshape infrastructure provider health data for the dashboard."""
+    """
+    Extract model provider (llama.cpp) health from the infrastructure RPC.
+
+    The gateway periodically probes the LLM server's /models endpoint.
+    We report health status, latency, and failure count.
+    """
     if not infra or "providers" not in infra:
         return {"status": "error", "error": "No provider data from gateway"}
 
@@ -143,7 +195,17 @@ def _reshape_provider(infra: dict) -> dict:
 
 
 def _reshape_tunnel(infra: dict) -> dict:
-    """Reshape infrastructure tunnel data for the dashboard."""
+    """
+    Extract SSH tunnel status from the infrastructure RPC.
+
+    The gateway checks TCP reachability of the tunnel port and queries
+    systemd for the tunnel service status.
+
+    Status logic:
+      - "ok" if port is reachable
+      - "degraded" if service is active but port is unreachable
+      - "error" if both are down
+    """
     if not infra or "tunnels" not in infra:
         return {"status": "error", "error": "No tunnel data from gateway"}
 
@@ -185,7 +247,12 @@ def _reshape_tunnel(infra: dict) -> dict:
 
 
 def _reshape_gateway(health: dict) -> dict:
-    """Reshape gateway health data for the dashboard."""
+    """
+    Extract gateway + Discord bot status from the health RPC.
+
+    The health RPC returns the gateway's own status, active agent sessions,
+    and Discord bot connection info (if configured).
+    """
     if not health:
         return {"status": "error", "error": "Gateway unreachable"}
 
@@ -197,6 +264,7 @@ def _reshape_gateway(health: dict) -> dict:
         "discord": None,
     }
 
+    # Extract session info from the first agent
     agents = health.get("agents", [])
     if agents:
         agent = agents[0]
@@ -211,6 +279,7 @@ def _reshape_gateway(health: dict) -> dict:
             for s in recent[:5]
         ]
 
+    # Extract Discord bot info (if the discord channel is configured)
     discord = health.get("channels", {}).get("discord", {})
     if discord:
         probe = discord.get("probe", {})
@@ -225,37 +294,206 @@ def _reshape_gateway(health: dict) -> dict:
     return result
 
 
-# ---------------------------------------------------------------------------
-# Public API (individual collectors for per-endpoint use)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Local GPU collector (RTX 3090 on this WSL2 host)
+# ===========================================================================
+
+def _collect_local_gpu() -> dict:
+    """
+    Collect GPU metrics from the local machine via nvidia-smi.
+
+    This monitors the RTX 3090 that runs the multimodal services.
+    Unlike the DGX GPU stats (which come via gateway RPC), this runs
+    nvidia-smi directly as a subprocess.
+
+    Status logic:
+      - "ok" normally
+      - "degraded" if utilization > 95% or temperature > 90C
+      - "error" if nvidia-smi is unavailable or fails
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,utilization.gpu,temperature.gpu,"
+                "power.draw,power.limit,memory.used,memory.total,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return {"status": "error", "error": "nvidia-smi failed"}
+
+        # Parse CSV: "NVIDIA GeForce RTX 3090, 2, 40, 32.15, 350.00, 22433, 24576, 1894"
+        parts = [p.strip() for p in proc.stdout.strip().split(",")]
+        if len(parts) < 8:
+            return {"status": "error", "error": "Unexpected nvidia-smi output"}
+
+        name = parts[0]
+        util = int(parts[1])
+        temp = int(parts[2])
+        power_draw = float(parts[3])
+        power_limit = float(parts[4])
+        mem_used = int(parts[5])
+        mem_total = int(parts[6])
+        mem_free = int(parts[7])
+        mem_pct = round(mem_used / mem_total * 100, 1) if mem_total else 0
+
+        # Determine status
+        if util > 95 or temp > 90:
+            status = "degraded"
+        else:
+            status = "ok"
+
+        return {
+            "status": status,
+            "gpu_name": name,
+            "utilization_pct": util,
+            "temperature_c": temp,
+            "power_w": round(power_draw, 1),
+            "power_limit_w": round(power_limit, 1),
+            "memory_used_mb": mem_used,
+            "memory_total_mb": mem_total,
+            "memory_free_mb": mem_free,
+            "memory_pct": mem_pct,
+        }
+    except (subprocess.TimeoutExpired, Exception) as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ===========================================================================
+# Multimodal services collector (FastAPI services on ports 8101-8106)
+# ===========================================================================
+
+def _collect_multimodal() -> dict:
+    """
+    Check health of all 6 local multimodal AI services.
+
+    Each service exposes GET /health returning JSON like:
+      {"status": "ok", "service": "vision", "model": "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"}
+
+    We hit each endpoint and aggregate the results.
+
+    Status logic:
+      - "ok" if all services are up
+      - "degraded" if some (but not all) are down
+      - "error" if all services are down
+    """
+    services = {}
+    up_count = 0
+
+    for name, port in MULTIMODAL_SERVICES.items():
+        url = f"http://localhost:{port}/health"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=MULTIMODAL_HEALTH_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode())
+                svc_status = data.get("status", "unknown")
+                services[name] = {
+                    "status": "ok" if svc_status == "ok" else "loading" if svc_status == "loading" else "error",
+                    "port": port,
+                    "model": data.get("model"),
+                    "service": data.get("service", name),
+                }
+                if svc_status == "ok":
+                    up_count += 1
+        except (urllib.error.URLError, TimeoutError, Exception):
+            services[name] = {
+                "status": "error",
+                "port": port,
+                "model": None,
+                "service": name,
+            }
+
+    total = len(MULTIMODAL_SERVICES)
+    if up_count == total:
+        overall = "ok"
+    elif up_count == 0:
+        overall = "error"
+    else:
+        overall = "degraded"
+
+    return {
+        "status": overall,
+        "services_up": up_count,
+        "services_total": total,
+        "services": services,
+    }
+
+
+# ===========================================================================
+# Public API — individual collectors for per-endpoint use
+# ===========================================================================
 
 def collect_gpu_stats() -> dict:
+    """Collect DGX Spark GPU stats via gateway RPC."""
     return _reshape_gpu(_gateway_call("infrastructure"))
 
 def collect_provider_status() -> dict:
+    """Collect llama.cpp provider health via gateway RPC."""
     return _reshape_provider(_gateway_call("infrastructure"))
 
 def collect_gateway_status() -> dict:
+    """Collect gateway + Discord status via gateway RPC."""
     return _reshape_gateway(_gateway_call("health"))
 
 def collect_tunnel_status() -> dict:
+    """Collect SSH tunnel status via gateway RPC."""
     return _reshape_tunnel(_gateway_call("infrastructure"))
 
+def collect_local_gpu_stats() -> dict:
+    """Collect local RTX 3090 GPU stats via nvidia-smi."""
+    return _collect_local_gpu()
+
+def collect_multimodal_status() -> dict:
+    """Collect health status of all 6 multimodal services."""
+    return _collect_multimodal()
+
+
+# ===========================================================================
+# Combined collector — single call for the dashboard's /api/overview
+# ===========================================================================
 
 def collect_all() -> dict:
-    """Fetch all data with just 2 RPC calls and return combined results."""
+    """
+    Fetch all monitoring data and return a combined response.
+
+    Makes 2 gateway RPC calls (infrastructure + health) plus 1 local
+    nvidia-smi call and 6 HTTP health checks to multimodal services.
+    All results are reshaped into dashboard card format.
+
+    The overall status is the worst of all subsystem statuses:
+      - "ok" if everything is green
+      - "error" if any subsystem has an error
+      - "degraded" otherwise
+    """
     t0 = time.time()
 
-    # Only 2 RPC calls total — share the infrastructure result across cards
+    # Gateway RPC calls (2 total — shared across multiple cards)
     infra = _gateway_call("infrastructure")
     health = _gateway_call("health")
 
+    # Reshape gateway data into card format
     gpu = _reshape_gpu(infra)
     provider = _reshape_provider(infra)
     tunnel = _reshape_tunnel(infra)
     gateway = _reshape_gateway(health)
 
-    statuses = [gpu["status"], provider["status"], gateway["status"], tunnel["status"]]
+    # Local data collection (direct, no gateway)
+    local_gpu = _collect_local_gpu()
+    multimodal = _collect_multimodal()
+
+    # Compute overall status from all subsystems
+    statuses = [
+        gpu["status"],
+        provider["status"],
+        gateway["status"],
+        tunnel["status"],
+        local_gpu["status"],
+        multimodal["status"],
+    ]
     if all(s == "ok" for s in statuses):
         overall = "ok"
     elif any(s == "error" for s in statuses):
@@ -271,4 +509,6 @@ def collect_all() -> dict:
         "provider": provider,
         "gateway": gateway,
         "tunnel": tunnel,
+        "local_gpu": local_gpu,
+        "multimodal": multimodal,
     }
