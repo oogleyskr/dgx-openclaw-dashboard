@@ -41,10 +41,15 @@ MULTIMODAL_SERVICES = {
     "vision":     8102,   # Vision-Language (Qwen2.5-VL-7B-AWQ)
     "tts":        8103,   # Text-to-Speech (Kokoro-82M)
     "imagegen":   8104,   # Image Generation (SDXL-Turbo)
-    "embeddings": 8105,   # Text Embeddings (nomic-embed-text-v1.5)
-    "docutils":   8106,   # Document Parsing (CPU-only, pymupdf)
 }
 MULTIMODAL_HEALTH_TIMEOUT = 2  # seconds — timeout per service health check
+
+# Heartbeat LLM server — small model running locally for OpenClaw heartbeat duties
+HEARTBEAT_SERVER_PORT = 8200
+HEARTBEAT_SERVER_HOST = "localhost"
+
+# OpenClaw config file — read/write for heartbeat model configuration
+OPENCLAW_CONFIG_PATH = "/home/mferr/.openclaw/openclaw.json"
 
 
 # ===========================================================================
@@ -424,6 +429,168 @@ def _collect_multimodal() -> dict:
 
 
 # ===========================================================================
+# Heartbeat LLM server collector + config management
+# ===========================================================================
+
+def _collect_heartbeat_server() -> dict:
+    """
+    Check the heartbeat LLM server (Qwen3-1.7B on CPU, port 8200).
+
+    Probes the llama-server /health endpoint and /v1/models for model info.
+    Also checks the systemd service status for the heartbeat server.
+
+    Returns:
+        Dict with status, model info, server health, and systemd state.
+    """
+    result = {
+        "status": "error",
+        "port": HEARTBEAT_SERVER_PORT,
+        "model": None,
+        "server_healthy": False,
+        "service_active": False,
+        "service_status": None,
+    }
+
+    # Check llama-server health endpoint
+    try:
+        url = f"http://{HEARTBEAT_SERVER_HOST}:{HEARTBEAT_SERVER_PORT}/health"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+            result["server_healthy"] = data.get("status") == "ok"
+    except Exception:
+        pass
+
+    # Get model info from /v1/models
+    try:
+        url = f"http://{HEARTBEAT_SERVER_HOST}:{HEARTBEAT_SERVER_PORT}/v1/models"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+            models = data.get("data", [])
+            if models:
+                m = models[0]
+                result["model"] = m.get("id", "unknown")
+                meta = m.get("meta", {})
+                result["model_params"] = meta.get("n_params")
+                result["context_train"] = meta.get("n_ctx_train")
+    except Exception:
+        pass
+
+    # Check systemd service status
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", "llama-heartbeat.service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        svc_state = proc.stdout.strip()
+        result["service_active"] = svc_state == "active"
+        result["service_status"] = svc_state
+    except Exception:
+        pass
+
+    # Determine overall status
+    if result["server_healthy"]:
+        result["status"] = "ok"
+    elif result["service_active"]:
+        result["status"] = "degraded"  # service running but server not healthy yet
+    else:
+        result["status"] = "error"
+
+    return result
+
+
+def read_heartbeat_config() -> dict:
+    """
+    Read the current heartbeat configuration from openclaw.json.
+
+    Returns:
+        Dict with heartbeat enabled state, model, interval, and available
+        providers that could serve as heartbeat models.
+    """
+    try:
+        with open(OPENCLAW_CONFIG_PATH, "r") as f:
+            config = json.load(f)
+    except Exception as e:
+        return {"error": str(e)}
+
+    # Extract heartbeat config from agents.defaults
+    agents = config.get("agents", {}).get("defaults", {})
+    hb = agents.get("heartbeat", {})
+
+    # Extract available providers and their models for the picker
+    providers = config.get("models", {}).get("providers", {})
+    available_models = []
+    for prov_id, prov in providers.items():
+        for model in prov.get("models", []):
+            available_models.append({
+                "ref": f"{prov_id}/{model['id']}",
+                "name": model.get("name", model["id"]),
+                "provider": prov_id,
+                "model_id": model["id"],
+            })
+
+    return {
+        "enabled": bool(hb),  # heartbeat is enabled if the section exists
+        "model": hb.get("model", ""),
+        "every": hb.get("every", "30m"),
+        "prompt": hb.get("prompt", ""),
+        "available_models": available_models,
+    }
+
+
+def update_heartbeat_config(enabled: bool, model: str = "", every: str = "30m") -> dict:
+    """
+    Update the heartbeat configuration in openclaw.json.
+
+    Reads the current config, modifies the heartbeat section under
+    agents.defaults, and writes it back. Does NOT restart the gateway —
+    that must be done separately.
+
+    Args:
+        enabled: Whether heartbeat should be active.
+        model: Model ref string (e.g. "heartbeat/qwen3-1.7b-q4").
+               Empty string means use the agent's default model.
+        every: Heartbeat interval (e.g. "30m", "15m", "1h").
+
+    Returns:
+        Dict with success status and the new config values.
+    """
+    try:
+        with open(OPENCLAW_CONFIG_PATH, "r") as f:
+            config = json.load(f)
+
+        # Ensure agents.defaults exists
+        if "agents" not in config:
+            config["agents"] = {}
+        if "defaults" not in config["agents"]:
+            config["agents"]["defaults"] = {}
+
+        if enabled:
+            hb = {"every": every}
+            if model:
+                hb["model"] = model
+            config["agents"]["defaults"]["heartbeat"] = hb
+        else:
+            # Remove heartbeat section to disable
+            config["agents"]["defaults"].pop("heartbeat", None)
+
+        with open(OPENCLAW_CONFIG_PATH, "w") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+
+        return {
+            "success": True,
+            "enabled": enabled,
+            "model": model,
+            "every": every,
+            "restart_required": True,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ===========================================================================
 # Public API — individual collectors for per-endpoint use
 # ===========================================================================
 
@@ -448,8 +615,14 @@ def collect_local_gpu_stats() -> dict:
     return _collect_local_gpu()
 
 def collect_multimodal_status() -> dict:
-    """Collect health status of all 6 multimodal services."""
+    """Collect health status of multimodal services."""
     return _collect_multimodal()
+
+def collect_heartbeat_status() -> dict:
+    """Collect heartbeat LLM server status + config."""
+    server = _collect_heartbeat_server()
+    config = read_heartbeat_config()
+    return {**server, "config": config}
 
 
 # ===========================================================================
@@ -484,8 +657,10 @@ def collect_all() -> dict:
     # Local data collection (direct, no gateway)
     local_gpu = _collect_local_gpu()
     multimodal = _collect_multimodal()
+    heartbeat = collect_heartbeat_status()
 
     # Compute overall status from all subsystems
+    # Note: heartbeat is excluded from overall — it's auxiliary, not critical
     statuses = [
         gpu["status"],
         provider["status"],
@@ -511,4 +686,5 @@ def collect_all() -> dict:
         "tunnel": tunnel,
         "local_gpu": local_gpu,
         "multimodal": multimodal,
+        "heartbeat": heartbeat,
     }

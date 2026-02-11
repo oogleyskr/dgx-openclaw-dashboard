@@ -43,6 +43,9 @@ from src.api.collectors import (
     collect_tunnel_status,
     collect_local_gpu_stats,
     collect_multimodal_status,
+    collect_heartbeat_status,
+    read_heartbeat_config,
+    update_heartbeat_config,
     collect_all,
 )
 
@@ -70,15 +73,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
     HTTP request handler for the dashboard.
 
     Routes:
-      /                 → Dashboard HTML page
-      /api/gpu          → DGX Spark GPU stats (via gateway RPC)
-      /api/provider     → llama.cpp health (via gateway RPC)
-      /api/gateway      → Gateway + Discord status (via gateway RPC)
-      /api/tunnel       → SSH tunnel status (via gateway RPC)
-      /api/local-gpu    → Local RTX 3090 GPU stats (via nvidia-smi)
-      /api/multimodal   → Multimodal service health (6 services, HTTP)
-      /api/overview     → Combined status of all systems (recommended)
-      <other>           → Static file from public/ directory
+      GET  /                 → Dashboard HTML page
+      GET  /api/gpu          → DGX Spark GPU stats (via gateway RPC)
+      GET  /api/provider     → llama.cpp health (via gateway RPC)
+      GET  /api/gateway      → Gateway + Discord status (via gateway RPC)
+      GET  /api/tunnel       → SSH tunnel status (via gateway RPC)
+      GET  /api/local-gpu    → Local RTX 3090 GPU stats (via nvidia-smi)
+      GET  /api/multimodal   → Multimodal service health (HTTP)
+      GET  /api/heartbeat    → Heartbeat LLM server status + config
+      GET  /api/overview     → Combined status of all systems (recommended)
+      POST /api/heartbeat    → Update heartbeat config (enable/model/interval)
+      <other>               → Static file from public/ directory
     """
 
     def log_message(self, fmt, *args):
@@ -100,6 +105,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/tunnel":      self._api_tunnel,
             "/api/local-gpu":   self._api_local_gpu,
             "/api/multimodal":  self._api_multimodal,
+            "/api/heartbeat":   self._api_heartbeat,
             "/api/overview":    self._api_overview,
         }
 
@@ -153,14 +159,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json_response(collect_local_gpu_stats())
 
     def _api_multimodal(self):
-        """Health status of all 6 multimodal AI services."""
+        """Health status of multimodal AI services."""
         self._json_response(collect_multimodal_status())
+
+    def _api_heartbeat(self):
+        """Heartbeat LLM server status + config (GET) or update config (POST handled in do_POST)."""
+        self._json_response(collect_heartbeat_status())
 
     # --- API handlers (combined) ---
 
     def _api_overview(self):
         """Combined status of all monitored systems (recommended endpoint)."""
         self._json_response(collect_all())
+
+    # --- POST handlers ---
+
+    def do_POST(self):
+        """Route POST requests for config updates."""
+        path = self.path.split("?")[0]
+
+        if path == "/api/heartbeat":
+            self._post_heartbeat()
+        else:
+            self._respond(404, "text/plain", b"Not found")
+
+    def _post_heartbeat(self):
+        """
+        Update heartbeat config in openclaw.json.
+
+        Expected JSON body:
+            {"enabled": true, "model": "heartbeat/qwen3-1.7b-q4", "every": "30m"}
+
+        Note: Changes take effect after gateway restart.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode())
+
+            enabled = body.get("enabled", True)
+            model = body.get("model", "")
+            every = body.get("every", "30m")
+
+            result = update_heartbeat_config(enabled, model, every)
+            status = 200 if result.get("success") else 500
+            self._json_response(result, status)
+        except (json.JSONDecodeError, Exception) as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
 
     # --- Response helpers ---
 
@@ -209,15 +253,18 @@ def main():
     print(f"[dashboard] Data sources:")
     print(f"  - OpenClaw gateway RPC (ws://127.0.0.1:18789)")
     print(f"  - Local nvidia-smi (RTX 3090)")
-    print(f"  - Multimodal services (localhost:8101-8106)")
+    print(f"  - Multimodal services (localhost:8101-8104)")
+    print(f"  - Heartbeat LLM server (localhost:8200)")
     print(f"[dashboard] API endpoints:")
-    print(f"  GET /api/gpu         - DGX Spark GPU (via gateway RPC)")
-    print(f"  GET /api/provider    - llama.cpp health (via gateway RPC)")
-    print(f"  GET /api/gateway     - Gateway + Discord (via gateway RPC)")
-    print(f"  GET /api/tunnel      - SSH tunnel (via gateway RPC)")
-    print(f"  GET /api/local-gpu   - RTX 3090 GPU (local nvidia-smi)")
-    print(f"  GET /api/multimodal  - Multimodal services (local HTTP)")
-    print(f"  GET /api/overview    - Combined status (all sources)")
+    print(f"  GET  /api/gpu         - DGX Spark GPU (via gateway RPC)")
+    print(f"  GET  /api/provider    - llama.cpp health (via gateway RPC)")
+    print(f"  GET  /api/gateway     - Gateway + Discord (via gateway RPC)")
+    print(f"  GET  /api/tunnel      - SSH tunnel (via gateway RPC)")
+    print(f"  GET  /api/local-gpu   - RTX 3090 GPU (local nvidia-smi)")
+    print(f"  GET  /api/multimodal  - Multimodal services (local HTTP)")
+    print(f"  GET  /api/heartbeat   - Heartbeat LLM server + config")
+    print(f"  POST /api/heartbeat   - Update heartbeat config")
+    print(f"  GET  /api/overview    - Combined status (all sources)")
     print()
 
     try:

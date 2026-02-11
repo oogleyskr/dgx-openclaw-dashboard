@@ -225,6 +225,84 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* Form controls (heartbeat config)                                    */
+  /* ------------------------------------------------------------------ */
+  .control-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+    font-size: 14px;
+  }
+  .control-row:last-child { border-bottom: none; }
+  .control-row .label { color: var(--text-dim); }
+
+  /* Toggle switch */
+  .toggle {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    cursor: pointer;
+  }
+  .toggle input { display: none; }
+  .toggle .slider {
+    position: absolute;
+    inset: 0;
+    background: var(--border);
+    border-radius: 12px;
+    transition: background 0.2s;
+  }
+  .toggle .slider::before {
+    content: '';
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    left: 3px;
+    top: 3px;
+    background: var(--text);
+    border-radius: 50%;
+    transition: transform 0.2s;
+  }
+  .toggle input:checked + .slider { background: var(--green); }
+  .toggle input:checked + .slider::before { transform: translateX(20px); }
+
+  /* Select dropdown */
+  .hb-select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 13px;
+    font-family: inherit;
+    max-width: 220px;
+    cursor: pointer;
+  }
+  .hb-select:focus { outline: 1px solid var(--blue); }
+
+  /* Save button */
+  .hb-save {
+    background: var(--green);
+    color: #000;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s;
+  }
+  .hb-save:hover { opacity: 0.85; }
+  .hb-save:disabled { opacity: 0.4; cursor: not-allowed; }
+  .hb-save-msg {
+    font-size: 12px;
+    margin-left: 8px;
+  }
+  .hb-save-msg.success { color: var(--green); }
+  .hb-save-msg.error { color: var(--red); }
+
+  /* ------------------------------------------------------------------ */
   /* Error message                                                       */
   /* ------------------------------------------------------------------ */
   .error-msg {
@@ -338,6 +416,17 @@
     </div>
   </section>
 
+  <!-- Card 7: Heartbeat LLM Server (config + status) — full width -->
+  <section class="card loading" id="card-heartbeat" style="grid-column: 1 / -1;">
+    <div class="card-title">
+      Heartbeat LLM Server
+      <span class="badge loading" id="heartbeat-badge">--</span>
+    </div>
+    <div id="heartbeat-body">
+      <div class="metric"><span class="label">Loading...</span></div>
+    </div>
+  </section>
+
   <!-- Activity log — recent status changes (full width) -->
   <section class="card" id="card-activity" style="grid-column: 1 / -1;">
     <div class="card-title">Recent Activity</div>
@@ -380,6 +469,7 @@
     gateway:    { card: 'card-gateway',    badge: 'gateway-badge',    body: 'gateway-body' },
     tunnel:     { card: 'card-tunnel',     badge: 'tunnel-badge',     body: 'tunnel-body' },
     multimodal: { card: 'card-multimodal', badge: 'multimodal-badge', body: 'multimodal-body' },
+    heartbeat:  { card: 'card-heartbeat',  badge: 'heartbeat-badge',  body: 'heartbeat-body' },
   };
 
   var activityLog = document.getElementById('activity-log');
@@ -686,8 +776,6 @@
         { key: 'vision',     label: 'Vision' },
         { key: 'tts',        label: 'TTS' },
         { key: 'imagegen',   label: 'ImageGen' },
-        { key: 'embeddings', label: 'Embed' },
-        { key: 'docutils',   label: 'DocParse' },
       ];
 
       order.forEach(function(item) {
@@ -710,6 +798,123 @@
     body.innerHTML = html;
     addLog('Multimodal: ' + (data.services_up || 0) + '/' + (data.services_total || 0) + ' services up');
   }
+
+  /**
+   * Render the heartbeat LLM server card.
+   * Shows server status, model info, systemd state, and config controls
+   * (enable/disable toggle, model picker, save button).
+   */
+  function renderHeartbeat(data) {
+    var body = document.getElementById(cards.heartbeat.body);
+    setStatus('heartbeat', data.status);
+
+    if (data.status === 'error' && !data.config) {
+      body.innerHTML = '<div class="error-msg">Heartbeat server offline</div>';
+      addLog('Heartbeat: OFFLINE');
+      return;
+    }
+
+    var cfg = data.config || {};
+    var html = '';
+
+    // Server status section
+    html += metric('Server', data.server_healthy ? 'Healthy' : 'Down');
+    html += metric('Port', data.port || '--');
+    if (data.model) html += metric('Model', data.model);
+    if (data.model_params) html += metric('Parameters', (data.model_params / 1e9).toFixed(1) + 'B');
+    if (data.context_train) html += metric('Max Context', (data.context_train / 1024).toFixed(0) + 'K tokens');
+    if (data.service_status) html += metric('Systemd', data.service_status);
+
+    // Config controls
+    html += '<div style="margin-top:16px; padding-top:12px; border-top:1px solid var(--border);">';
+    html += '<div style="font-size:13px; color:var(--text-dim); margin-bottom:8px; font-weight:600;">HEARTBEAT CONFIG</div>';
+
+    // Enable/disable toggle
+    var checked = cfg.enabled ? 'checked' : '';
+    html += '<div class="control-row">' +
+      '<span class="label">Enabled</span>' +
+      '<label class="toggle"><input type="checkbox" id="hb-enabled" ' + checked + '><span class="slider"></span></label>' +
+      '</div>';
+
+    // Model picker
+    html += '<div class="control-row">' +
+      '<span class="label">Model</span>' +
+      '<select class="hb-select" id="hb-model">';
+    var models = cfg.available_models || [];
+    models.forEach(function(m) {
+      var sel = m.ref === cfg.model ? ' selected' : '';
+      html += '<option value="' + esc(m.ref) + '"' + sel + '>' + esc(m.name) + '</option>';
+    });
+    if (!models.length) html += '<option value="">No models available</option>';
+    html += '</select></div>';
+
+    // Interval
+    html += '<div class="control-row">' +
+      '<span class="label">Interval</span>' +
+      '<select class="hb-select" id="hb-every">';
+    var intervals = ['5m','10m','15m','30m','1h','2h'];
+    intervals.forEach(function(v) {
+      var sel = v === cfg.every ? ' selected' : '';
+      html += '<option value="' + v + '"' + sel + '>' + v + '</option>';
+    });
+    html += '</select></div>';
+
+    // Save button
+    html += '<div class="control-row" style="border-bottom:none; padding-top:12px;">' +
+      '<span></span>' +
+      '<div><button class="hb-save" id="hb-save-btn" onclick="saveHeartbeat()">Save Config</button>' +
+      '<span class="hb-save-msg" id="hb-save-msg"></span></div>' +
+      '</div>';
+
+    html += '</div>';
+    body.innerHTML = html;
+    addLog('Heartbeat: ' + (data.server_healthy ? 'healthy' : 'down') +
+           ', model=' + (data.model || 'none') +
+           ', enabled=' + (cfg.enabled ? 'yes' : 'no'));
+  }
+
+  /**
+   * Save heartbeat config to openclaw.json via POST /api/heartbeat.
+   * Reads values from the form controls in the heartbeat card.
+   * Shows success/error message and notes that gateway restart is needed.
+   */
+  window.saveHeartbeat = function() {
+    var btn = document.getElementById('hb-save-btn');
+    var msg = document.getElementById('hb-save-msg');
+    var enabled = document.getElementById('hb-enabled').checked;
+    var model = document.getElementById('hb-model').value;
+    var every = document.getElementById('hb-every').value;
+
+    btn.disabled = true;
+    msg.className = 'hb-save-msg';
+    msg.textContent = 'Saving...';
+
+    fetch('/api/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: enabled, model: model, every: every }),
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      btn.disabled = false;
+      if (data.success) {
+        msg.className = 'hb-save-msg success';
+        msg.textContent = 'Saved! Restart gateway to apply.';
+        addLog('Heartbeat config saved (restart required)');
+      } else {
+        msg.className = 'hb-save-msg error';
+        msg.textContent = 'Error: ' + (data.error || 'Unknown');
+        addLog('Heartbeat config save FAILED: ' + (data.error || ''));
+      }
+      setTimeout(function() { msg.textContent = ''; }, 5000);
+    })
+    .catch(function(err) {
+      btn.disabled = false;
+      msg.className = 'hb-save-msg error';
+      msg.textContent = 'Network error';
+      addLog('Heartbeat save error: ' + err);
+    });
+  };
 
   // ----------------------------------------------------------------
   // Polling — fetch /api/overview every POLL_INTERVAL ms
@@ -736,6 +941,7 @@
         if (data.gateway)    renderGateway(data.gateway);
         if (data.tunnel)     renderTunnel(data.tunnel);
         if (data.multimodal) renderMultimodal(data.multimodal);
+        if (data.heartbeat)  renderHeartbeat(data.heartbeat);
       })
       .catch(function(err) {
         $overall.className = 'badge error';
