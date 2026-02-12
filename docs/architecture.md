@@ -44,9 +44,9 @@ gateway's built-in infrastructure RPC — no direct SSH or systemd calls.
 |  Ubuntu 24.04                             |
 |                                           |
 |  +-------------------------------------+ |
-|  | llama.cpp (llama-server)            | |
-|  | Qwen3-Coder-Next-Q4_K_M GGUF       | |
-|  | --ctx-size 131072                   | |
+|  | SGLang (Docker)                     | |
+|  | gpt-oss-120b MXFP4                  | |
+|  | context 131072                      | |
 |  | Listening on port 8000              | |
 |  +-------------------------------------+ |
 |                                           |
@@ -87,7 +87,7 @@ Dashboard --subprocess--> node dist/entry.js gateway call health
 | Endpoint          | Source RPC       | Data                                   |
 |-------------------|------------------|----------------------------------------|
 | `GET /api/gpu`    | infrastructure   | GPU name, util%, temp, power           |
-| `GET /api/provider`| infrastructure  | llama.cpp health, latency, failures    |
+| `GET /api/provider`| infrastructure  | SGLang health, latency, failures       |
 | `GET /api/gateway`| health           | Gateway status, Discord, sessions      |
 | `GET /api/tunnel` | infrastructure   | TCP reachability, service status       |
 | `GET /api/overview`| both            | All of the above, combined             |

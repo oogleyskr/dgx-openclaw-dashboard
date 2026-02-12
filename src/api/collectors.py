@@ -4,11 +4,11 @@ Data collectors for the DGX OpenClaw Dashboard.
 Pulls live data from three sources:
   1. OpenClaw gateway RPC (infrastructure + health methods)
      - DGX Spark GPU stats (remote, via SSH + nvidia-smi on the DGX)
-     - Model provider health (llama.cpp on DGX)
+     - Model provider health (SGLang on DGX)
      - SSH tunnel status
      - Gateway + Discord bot status
   2. Local nvidia-smi (RTX 3090 GPU on this WSL2 host)
-  3. Local HTTP health endpoints (multimodal AI services on ports 8101-8106)
+  3. Local HTTP health endpoints (multimodal AI services on ports 8101-8104)
 
 Architecture:
   - The gateway RPC calls use subprocess to invoke the OpenClaw CLI, which
@@ -164,7 +164,7 @@ def _reshape_gpu(infra: dict) -> dict:
 
 def _reshape_provider(infra: dict) -> dict:
     """
-    Extract model provider (llama.cpp) health from the infrastructure RPC.
+    Extract model provider (SGLang) health from the infrastructure RPC.
 
     The gateway periodically probes the LLM server's /models endpoint.
     We report health status, latency, and failure count.
@@ -184,7 +184,7 @@ def _reshape_provider(infra: dict) -> dict:
     result = {
         "status": status,
         "provider": provider_id,
-        "server": "llama.cpp",
+        "server": "sglang",
         "base_url": provider.get("baseUrl", ""),
         "healthy": healthy,
         "latency_ms": provider.get("latencyMs"),
@@ -369,12 +369,12 @@ def _collect_local_gpu() -> dict:
 
 
 # ===========================================================================
-# Multimodal services collector (FastAPI services on ports 8101-8106)
+# Multimodal services collector (FastAPI services on ports 8101-8104)
 # ===========================================================================
 
 def _collect_multimodal() -> dict:
     """
-    Check health of all 6 local multimodal AI services.
+    Check health of all 4 local multimodal AI services.
 
     Each service exposes GET /health returning JSON like:
       {"status": "ok", "service": "vision", "model": "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"}
@@ -599,7 +599,7 @@ def collect_gpu_stats() -> dict:
     return _reshape_gpu(_gateway_call("infrastructure"))
 
 def collect_provider_status() -> dict:
-    """Collect llama.cpp provider health via gateway RPC."""
+    """Collect SGLang provider health via gateway RPC."""
     return _reshape_provider(_gateway_call("infrastructure"))
 
 def collect_gateway_status() -> dict:
@@ -634,7 +634,7 @@ def collect_all() -> dict:
     Fetch all monitoring data and return a combined response.
 
     Makes 2 gateway RPC calls (infrastructure + health) plus 1 local
-    nvidia-smi call and 6 HTTP health checks to multimodal services.
+    nvidia-smi call and 4 HTTP health checks to multimodal services.
     All results are reshaped into dashboard card format.
 
     The overall status is the worst of all subsystem statuses:

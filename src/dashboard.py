@@ -7,7 +7,7 @@ pull live metrics from multiple sources:
 
   1. OpenClaw gateway RPC (via subprocess → WebSocket at ws://127.0.0.1:18789)
      - DGX Spark GPU stats (remote, nvidia-smi via SSH)
-     - Model provider health (llama.cpp on DGX)
+     - Model provider health (SGLang on DGX)
      - SSH tunnel status
      - Gateway + Discord bot status
 
@@ -15,8 +15,7 @@ pull live metrics from multiple sources:
      - RTX 3090 GPU: utilization, temperature, power, VRAM
 
   3. Local HTTP health endpoints (multimodal AI services)
-     - 6 FastAPI services on ports 8101-8106 (STT, Vision, TTS, ImageGen,
-       Embeddings, DocParse)
+     - 4 FastAPI services on ports 8101-8104 (STT, Vision, TTS, ImageGen)
 
 Usage:
     python3 src/dashboard.py            # starts on 0.0.0.0:8080
@@ -75,7 +74,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     Routes:
       GET  /                 → Dashboard HTML page
       GET  /api/gpu          → DGX Spark GPU stats (via gateway RPC)
-      GET  /api/provider     → llama.cpp health (via gateway RPC)
+      GET  /api/provider     → SGLang health (via gateway RPC)
       GET  /api/gateway      → Gateway + Discord status (via gateway RPC)
       GET  /api/tunnel       → SSH tunnel status (via gateway RPC)
       GET  /api/local-gpu    → Local RTX 3090 GPU stats (via nvidia-smi)
@@ -141,7 +140,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json_response(collect_gpu_stats())
 
     def _api_provider(self):
-        """llama.cpp model provider health from gateway infrastructure RPC."""
+        """SGLang model provider health from gateway infrastructure RPC."""
         self._json_response(collect_provider_status())
 
     def _api_gateway(self):
@@ -257,7 +256,7 @@ def main():
     print(f"  - Heartbeat LLM server (localhost:8200)")
     print(f"[dashboard] API endpoints:")
     print(f"  GET  /api/gpu         - DGX Spark GPU (via gateway RPC)")
-    print(f"  GET  /api/provider    - llama.cpp health (via gateway RPC)")
+    print(f"  GET  /api/provider    - SGLang health (via gateway RPC)")
     print(f"  GET  /api/gateway     - Gateway + Discord (via gateway RPC)")
     print(f"  GET  /api/tunnel      - SSH tunnel (via gateway RPC)")
     print(f"  GET  /api/local-gpu   - RTX 3090 GPU (local nvidia-smi)")
